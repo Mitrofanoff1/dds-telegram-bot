@@ -64,67 +64,72 @@ git push -u origin main
 
 ---
 
-## Часть 2. Развернуть бота на Render.com
+## Часть 2. Развернуть бота на Render.com (бесплатно)
 
-Бот работает в режиме **polling** (постоянно опрашивает Telegram). На Render для этого подходит тип сервиса **Background Worker**.
+На Render **бесплатный тариф есть только у Web Service**, а не у Background Worker. Поэтому бот настроен на режим **webhook**: Telegram сам отправляет обновления на ваш сервис. Создаём **Web Service** — так можно использовать бесплатный план.
 
 ### 2.1. Регистрация на Render
 
 1. Зайдите на [render.com](https://render.com).
 2. Нажмите **Get Started for Free**.
-3. Войдите через **GitHub** (удобно — Render получит доступ к вашим репозиториям).
+3. Войдите через **GitHub** или через Google (в последнем случае в настройках аккаунта Render подключите GitHub: Account Settings → Connected accounts → GitHub).
 
-### 2.2. Создать Background Worker
+### 2.2. Создать Web Service (не Background Worker)
 
-1. В личном кабинете Render нажмите **New +** → **Background Worker**.
-2. В списке репозиториев выберите **dds-telegram-bot** (если его нет — нажмите **Configure account** и дайте Render доступ к нужному репо).
+1. В личном кабинете Render нажмите **New +** → **Web Service**.
+2. В списке репозиториев выберите **dds-telegram-bot** (если его нет — **Configure account** и дайте доступ к репо).
 3. Заполните:
-   - **Name:** например `dds-bot`.
+   - **Name:** например `dds-bot` (от этого имени будет URL: `https://dds-bot.onrender.com`).
    - **Region:** выберите ближайший (например Frankfurt).
    - **Branch:** `main`.
+   - **Runtime:** Python 3.
    - **Build Command:**  
      `pip install -r requirements.txt`
    - **Start Command:**  
-     `python run_on_render.py`  
-     (используем отдельный скрипт, который создаёт `credentials.json` из переменной окружения и запускает бота — см. ниже.)
+     `python run_on_render.py`
+4. В блоке **Instance Type** выберите **Free** (бесплатный вариант).
 
-### 2.3. Переменные окружения (Environment Variables)
+### 2.3. Переменные окружения (Environment)
 
-В том же сервисе откройте вкладку **Environment** и добавьте переменные (кнопка **Add Environment Variable**):
+В том же сервисе откройте вкладку **Environment** и добавьте переменные:
 
 | Key | Value |
 |-----|--------|
 | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather |
 | `GOOGLE_SHEET_ID` | ID вашей Google-таблицы |
 | `GOOGLE_CREDENTIALS_PATH` | `credentials.json` |
-| `CREDENTIALS_JSON` | **Весь текст** из вашего файла `credentials.json` (скопируйте от первой `{` до последней `}`). В Render можно вставить многострочное значение. |
+| `CREDENTIALS_JSON` | **Весь текст** из файла `credentials.json` (от первой `{` до последней `}`). |
+| `WEBHOOK_BASE_URL` | URL вашего сервиса: `https://dds-bot.onrender.com` (подставьте **точный** URL из шапки сервиса Render, например `https://dds-telegram-bot-38zf.onrender.com`). |
+| `PYTHON_VERSION` | `3.12.7` (обязательно для совместимости с python-telegram-bot на Render). |
 
 Опционально:
 
-- `TELEGRAM_ALLOWED_IDS` — ваш Telegram user id (число) или несколько через запятую, если нужно ограничить доступ.
+- `TELEGRAM_ALLOWED_IDS` — ваш Telegram user id или несколько через запятую, если нужно ограничить доступ.
 
-**Как вставить CREDENTIALS_JSON:** откройте локальный `credentials.json`, скопируйте всё содержимое (одной строкой или с переносами — Render примет), вставьте в поле Value. Кавычки внутри JSON не удаляйте.
+**Важно:** `WEBHOOK_BASE_URL` должен совпадать с тем, что Render показывает как URL сервиса (после создания его видно в шапке сервиса). Без этой переменной бот не перейдёт в режим webhook и на Render не заработает. `PYTHON_VERSION=3.12.7` нужен, чтобы Render не использовал Python 3.14 (с ним бывают ошибки asyncio).
 
 ### 2.4. Сохранить и развернуть
 
-1. Нажмите **Create Background Worker**.
-2. Render начнёт сборку (Build), затем запустит **Start Command**. В логах (вкладка **Logs**) должно быть видно запуск бота без ошибок.
+1. Нажмите **Create Web Service**.
+2. Render соберёт проект и запустит бота. В **Logs** должно появиться что-то вроде: `[Бот] Режим webhook: https://dds-bot.onrender.com/webhook ...`.
+3. Напишите боту в Telegram (например /start). Если сервис только что «проснулся», первый ответ может прийти с задержкой 30–60 секунд — это нормально для бесплатного плана.
 
-Если в логах есть ошибка про `credentials.json` или `CREDENTIALS_JSON` — проверьте, что переменная `CREDENTIALS_JSON` задана и содержит полный JSON (начинается с `{` и заканчивается на `}`).
+Если в логах ошибка про `credentials.json` или `CREDENTIALS_JSON` — проверьте, что переменная содержит полный JSON (начинается с `{`, заканчивается на `}`).
 
-### 2.5. Бесплатный план Render
+### 2.5. Про бесплатный план
 
-- **Free** Background Worker может работать ограниченное количество часов в месяц (уточняйте на [render.com](https://render.com) в разделе планов).
-- После неактивности сервис может «засыпать»; при следующем запросе к боту возможна задержка (пока сервис снова поднимется). Для круглосуточной работы без ограничений нужен платный план.
+- **Web Service** на бесплатном тарифе «засыпает» после примерно 15 минут без запросов.
+- Когда кто-то пишет боту, Telegram отправляет запрос на ваш URL → Render будит сервис. Первый ответ после «сна» может быть с задержкой (cold start).
+- Для одного бота этого обычно достаточно. Если нужна работа без задержек 24/7 — смотрите платные тарифы Render или другой хостинг.
 
 ---
 
 ## Краткий чеклист
 
-- [ ] Git установлен, репозиторий создан на GitHub, код запушен (`git push`).
-- [ ] На Render создан Background Worker, подключён репозиторий `dds-telegram-bot`.
+- [ ] На Render создан **Web Service** (не Background Worker), репозиторий `dds-telegram-bot`.
+- [ ] Instance Type: **Free**.
 - [ ] Build: `pip install -r requirements.txt`, Start: `python run_on_render.py`.
-- [ ] В Environment заданы: `TELEGRAM_BOT_TOKEN`, `GOOGLE_SHEET_ID`, `GOOGLE_CREDENTIALS_PATH=credentials.json`, `CREDENTIALS_JSON` (полный JSON ключа).
-- [ ] В Logs нет ошибок, бот в Telegram отвечает на /start.
+- [ ] В Environment заданы: `TELEGRAM_BOT_TOKEN`, `GOOGLE_SHEET_ID`, `GOOGLE_CREDENTIALS_PATH=credentials.json`, `CREDENTIALS_JSON`, **`WEBHOOK_BASE_URL`** (например `https://dds-bot.onrender.com`).
+- [ ] В Logs есть строка про «Режим webhook», бот в Telegram отвечает на /start.
 
 Если на каком-то шаге что-то не получается — напишите, на каком шаге и что именно видите (сообщение об ошибке или скрин).

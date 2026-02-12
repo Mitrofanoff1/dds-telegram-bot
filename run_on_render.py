@@ -4,9 +4,16 @@
 Создаёт credentials.json из переменной окружения CREDENTIALS_JSON и запускает bot.py.
 В Render в Environment задайте CREDENTIALS_JSON = полное содержимое вашего credentials.json.
 """
+import asyncio
 import os
 import sys
 import traceback
+
+# Python 3.10+: в MainThread должен быть event loop до любого кода PTB
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 def main():
     creds_json = os.environ.get("CREDENTIALS_JSON")
