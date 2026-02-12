@@ -6,19 +6,35 @@
 """
 import os
 import sys
+import traceback
 
 def main():
     creds_json = os.environ.get("CREDENTIALS_JSON")
     if creds_json:
         path = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credentials.json")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(creds_json)
-        print("credentials.json создан из CREDENTIALS_JSON", file=sys.stderr)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(creds_json)
+            print("credentials.json создан из CREDENTIALS_JSON", file=sys.stderr)
+        except Exception as e:
+            print(f"Ошибка записи credentials.json: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            sys.exit(1)
     else:
         print("CREDENTIALS_JSON не задан; ожидается файл credentials.json", file=sys.stderr)
 
-    import bot
-    bot.main()
+    webhook_base = os.environ.get("WEBHOOK_BASE_URL", "").strip()
+    if not webhook_base:
+        print("WEBHOOK_BASE_URL не задан. Задайте в Environment URL сервиса, например https://dds-telegram-bot-38zf.onrender.com", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        import bot
+        bot.main()
+    except Exception as e:
+        print(f"Ошибка запуска бота: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
