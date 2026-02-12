@@ -2974,7 +2974,8 @@ def _run_webhook_with_health(app: Application, port: int, webhook_url: str) -> N
 
     async def run() -> None:
         await app.initialize()
-        await app.post_init()
+        if callable(getattr(app, "post_init", None)):
+            await app.post_init()
         await app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
         await app.start()
         app_web = web.Application()
