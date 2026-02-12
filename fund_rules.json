@@ -1,0 +1,17 @@
+[
+  {
+    "source": "Сбербанк",
+    "destination": "Фонд Развития",
+    "percent": 10.0
+  },
+  {
+    "source": "Сбербанк",
+    "destination": "Фонд Мастер",
+    "percent": 10.0
+  },
+  {
+    "source": "Сбербанк",
+    "destination": "Фонд Налоги",
+    "percent": 6.0
+  }
+]
