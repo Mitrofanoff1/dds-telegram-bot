@@ -2954,6 +2954,50 @@ async def _save_transfer_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+def _run_webhook_with_health(app: Application, port: int, webhook_url: str) -> None:
+    """Запуск webhook с маршрутом GET / (200 OK) для cron-job.org и POST /webhook для Telegram."""
+    from aiohttp import web
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK", status=200)
+
+    async def webhook_handler(request: web.Request) -> web.Response:
+        if request.method != "POST":
+            return web.Response(status=405)
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.update_queue.put(update)
+        except Exception:
+            pass
+        return web.Response(status=200)
+
+    async def run() -> None:
+        await app.initialize()
+        await app.post_init()
+        await app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        await app.start()
+        app_web = web.Application()
+        app_web.router.add_get("/", health)
+        app_web.router.add_get("/health", health)
+        app_web.router.add_post("/webhook", webhook_handler)
+        runner = web.AppRunner(app_web)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await runner.cleanup()
+            await app.stop()
+            await app.shutdown()
+
+    asyncio.run(run())
+
+
 def main() -> None:
     # На Python 3.10+ в MainThread может не быть event loop — PTB падает без этого
     try:
@@ -3055,7 +3099,8 @@ def main() -> None:
     )
 
     # Увеличенные таймауты: при медленном Google Sheets ответ бота не должен обрываться (TimedOut)
-    app = (
+    webhook_base = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+    builder = (
         Application.builder()
         .token(token)
         .connect_timeout(30.0)
@@ -3064,8 +3109,10 @@ def main() -> None:
         .get_updates_connect_timeout(30.0)
         .get_updates_read_timeout(30.0)
         .get_updates_write_timeout(30.0)
-        .build()
     )
+    if webhook_base:
+        builder = builder.updater(None)  # свой сервер с GET / для cron и POST /webhook
+    app = builder.build()
     # Ограничение доступа: если задан TELEGRAM_ALLOWED_IDS, только эти пользователи могут пользоваться ботом
     if allowed_ids:
         app.add_handler(
@@ -3108,18 +3155,11 @@ def main() -> None:
     ))
     app.add_error_handler(_global_error_handler)
 
-    webhook_base = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
     if webhook_base:
         port = int(os.environ.get("PORT", "8443"))
         webhook_url = f"{webhook_base}/webhook"
-        print(f"[Бот] Режим webhook: {webhook_url}, порт {port}", file=sys.stderr)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="webhook",
-            webhook_url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        print(f"[Бот] Режим webhook: {webhook_url}, порт {port}, GET / для cron", file=sys.stderr)
+        _run_webhook_with_health(app, port, webhook_url)
     else:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
