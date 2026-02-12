@@ -2960,6 +2960,12 @@ async def _save_transfer_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
+    # На Python 3.10+ в MainThread может не быть event loop — PTB падает без этого
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в .env")
@@ -3106,7 +3112,21 @@ def main() -> None:
         pattern=f"^({re.escape(CB_CONFIRM_YES)}|{re.escape(CB_TEXT_CONFIRM_YES)})$",
     ))
     app.add_error_handler(_global_error_handler)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    webhook_base = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+    if webhook_base:
+        port = int(os.environ.get("PORT", "8443"))
+        webhook_url = f"{webhook_base}/webhook"
+        print(f"[Бот] Режим webhook: {webhook_url}, порт {port}", file=sys.stderr)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="webhook",
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 async def _confirm_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
