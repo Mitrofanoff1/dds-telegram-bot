@@ -72,16 +72,11 @@ class _BlockedUserHandler(BaseHandler[Update, ContextTypes.DEFAULT_TYPE, None]):
 
 
 async def _deny_access_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ пользователю, которому доступ к боту запрещён. Останавливаем обработку, чтобы другие обработчики не выполнялись."""
+    """Для пользователей не из allowlist — никакого ответа (будто бот не работает). Останавливаем обработку."""
     try:
         if update.callback_query:
-            await update.callback_query.answer()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Доступ к боту ограничен.",
-            )
-        elif update.message:
-            await update.message.reply_text("Доступ к боту ограничен.")
+            await update.callback_query.answer()  # снимаем «загрузку» у кнопки, без текста
+        # Сообщение не отправляем — полная тишина для посторонних
     except Exception:
         pass
     raise ApplicationHandlerStop
