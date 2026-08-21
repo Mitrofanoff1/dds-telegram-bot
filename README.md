@@ -1,3 +1,13 @@
+---
+title: DDS Telegram Bot
+emoji: 💰
+colorFrom: green
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Telegram-бот для реестра ДДС
 
 Бот добавляет операции в Google Таблицу «ДДС: месяц»: поступления, выбытия и переводы между счетами. Справочники (кошельки, статьи, направление бизнеса) читаются из таблицы.
