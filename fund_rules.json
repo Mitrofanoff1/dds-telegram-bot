@@ -1,17 +1,22 @@
 [
   {
     "source": "Сбербанк",
-    "destination": "Фонд Развития",
-    "percent": 10.0
-  },
-  {
-    "source": "Сбербанк",
     "destination": "Фонд Мастер",
-    "percent": 10.0
+    "percent": 30.0
   },
   {
     "source": "Сбербанк",
-    "destination": "Фонд Налоги",
-    "percent": 6.0
+    "destination": "Фонд Налогов и Безопасности",
+    "percent": 8.0
+  },
+  {
+    "source": "Сбербанк",
+    "destination": "Фонд Развития",
+    "percent": 7.0
+  },
+  {
+    "source": "Сбербанк",
+    "destination": "Фонд Расходов",
+    "percent": 4.0
   }
 ]

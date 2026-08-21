@@ -284,9 +284,10 @@ CB_TRANSFER_TO_PAGE_PREV = "tr_to_page_prev"
 
 # Правила отчислений по умолчанию: источник → фонд, %
 DEFAULT_FUND_RULES = [
-    {"source": "Сбербанк", "destination": "Фонд Развития", "percent": 10},
-    {"source": "Сбербанк", "destination": "Фонд Мастер", "percent": 10},
-    {"source": "Сбербанк", "destination": "Фонд Налоги", "percent": 5},
+    {"source": "Сбербанк", "destination": "Фонд Мастер", "percent": 30},
+    {"source": "Сбербанк", "destination": "Фонд Налогов и Безопасности", "percent": 8},
+    {"source": "Сбербанк", "destination": "Фонд Развития", "percent": 7},
+    {"source": "Сбербанк", "destination": "Фонд Расходов", "percent": 4},
 ]
 
 DATE_PATTERN = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*$")

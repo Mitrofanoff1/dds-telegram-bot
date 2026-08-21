@@ -131,6 +131,13 @@ def _load_credentials(credentials_path: str, scopes: list) -> Credentials:
             break
         except json.JSONDecodeError as e:
             msg = str(e)
+            if "Expecting property name enclosed in double quotes" in msg or "property name" in msg.lower():
+                raise RuntimeError(
+                    "Неверный формат credentials (ожидается JSON в двойных кавычках). "
+                    "На Render проверьте переменную CREDENTIALS_JSON: вставьте целиком содержимое файла credentials.json "
+                    "из Google Cloud (от первой { до последней }), без одинарных кавычек. "
+                    "Оригинал: " + msg
+                ) from e
             pos = getattr(e, "pos", None)
             if pos is None or pos < 0 or pos >= len(sanitized):
                 raise
