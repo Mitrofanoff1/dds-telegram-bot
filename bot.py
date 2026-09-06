@@ -267,6 +267,8 @@ CB_STATS_CANCEL = "stats_cancel"
 CB_STATS_BACK = "stats_back"
 CB_STATS_RANGE = "stats_range"
 CB_STATS_OPEN = "stats_open"  # открыть выбор периода отчёта (кнопка под балансом)
+CB_STATS_DETAILS = "stats_details"  # раскрыть разбивку по статьям под отчётом
+CB_STATS_BRIEF = "stats_brief"      # свернуть разбивку обратно
 CB_SETTINGS_ADD_WALLET = "settings_add_wallet"
 CB_SETTINGS_ADD_WALLET_SLOT_PREFIX = "settings_wallet_slot:"
 CB_SETTINGS_ADD_WALLET_BACK = "settings_add_wallet_back"
@@ -1094,7 +1096,7 @@ def _format_rub(value: float) -> str:
     return f"{round(value):,}".replace(",", "\u00a0")
 
 
-def _breakdown_lines(data: dict, limit: int = 6) -> list:
+def _breakdown_lines(data: dict, limit: int = 10) -> list:
     """Строки разбивки «• статья — сумма», крупные сверху, хвост сворачивается."""
     items = sorted((data or {}).items(), key=lambda kv: -kv[1])
     lines = []
@@ -1106,8 +1108,8 @@ def _breakdown_lines(data: dict, limit: int = 6) -> list:
     return lines
 
 
-def _format_stats_report(period_label: str, period_str: str, report: dict) -> str:
-    """Текст отчёта для /stats: доходы и расходы с разбивкой, отчисления в фонды, баланс."""
+def _format_stats_report(period_label: str, period_str: str, report: dict, detailed: bool = False) -> str:
+    """Текст отчёта для /stats. По умолчанию только итоги; detailed — с разбивкой по статьям."""
     report = report or {}
     start_balance = report.get("start_balance")
     end_balance = report.get("end_balance")
@@ -1119,11 +1121,15 @@ def _format_stats_report(period_label: str, period_str: str, report: dict) -> st
 
     if revenue is not None:
         lines.append(f"💵 *Доходы*  +{_format_rub(revenue)} ₽")
-        lines += _breakdown_lines(report.get("income_by_article"))
-        lines.append("")
+        if detailed:
+            lines += _breakdown_lines(report.get("income_by_article"))
+            lines.append("")
     if expenses is not None:
         lines.append(f"💸 *Расходы*  −{_format_rub(expenses)} ₽")
-        lines += _breakdown_lines(report.get("expense_by_article"))
+        if detailed:
+            lines += _breakdown_lines(report.get("expense_by_article"))
+            lines.append("")
+    if not detailed:
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━")
@@ -1134,7 +1140,8 @@ def _format_stats_report(period_label: str, period_str: str, report: dict) -> st
     if funds:
         lines.append("")
         lines.append(f"🏦 *Отложено в фонды*  {_format_rub(sum(funds.values()))} ₽")
-        lines += _breakdown_lines(funds, limit=8)
+        if detailed:
+            lines += _breakdown_lines(funds, limit=8)
 
     if start_balance is not None or end_balance is not None:
         lines.append("")
@@ -1166,12 +1173,19 @@ def _keyboard_stats_waiting_range() -> InlineKeyboardMarkup:
     ])
 
 
-def _keyboard_stats_after_report() -> InlineKeyboardMarkup:
-    """Клавиатура под отчётом: Добавить операцию, Назад к выбору периода."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Добавить операцию в ДДС ✅", callback_data=CB_ADD_OPERATION)],
-        [InlineKeyboardButton("🔙 Назад", callback_data=CB_STATS_BACK)],
-    ])
+def _keyboard_stats_after_report(detailed: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура под отчётом: раскрыть/свернуть статьи, Добавить операцию, Назад."""
+    toggle = (
+        InlineKeyboardButton("⬆️ Свернуть", callback_data=CB_STATS_BRIEF)
+        if detailed
+        else InlineKeyboardButton("🔍 Показать по статьям", callback_data=CB_STATS_DETAILS)
+    )
+    rows = [[toggle], [InlineKeyboardButton("Добавить операцию в ДДС ✅", callback_data=CB_ADD_OPERATION)]]
+    sheet_url = _sheet_url()
+    if sheet_url:
+        rows.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data=CB_STATS_BACK)])
+    return InlineKeyboardMarkup(rows)
 
 
 async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1245,6 +1259,7 @@ async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAUL
             pass
         return
     period_str = f"{date_from} – {date_to}"
+    context.user_data["_last_stats"] = ("Диапазон", period_str, report)
     text_report = _format_stats_report("Диапазон", period_str, report)
     try:
         await update.message.reply_text(text_report, parse_mode="Markdown", reply_markup=_keyboard_stats_after_report())
@@ -1283,6 +1298,32 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+        return
+    if data in (CB_STATS_DETAILS, CB_STATS_BRIEF):
+        saved = context.user_data.get("_last_stats")
+        if not saved:
+            try:
+                await _retry_on_network(
+                    lambda: query.edit_message_text(
+                        "Отчёт устарел — соберите заново.", reply_markup=_keyboard_stats_period()
+                    )
+                )
+            except Exception:
+                pass
+            return
+        period_label, period_str, report = saved
+        detailed = data == CB_STATS_DETAILS
+        text = _format_stats_report(period_label, period_str, report, detailed=detailed)
+        kb = _keyboard_stats_after_report(detailed)
+        try:
+            await _retry_on_network(
+                lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            )
+        except Exception:
+            try:
+                await _retry_on_network(lambda: query.edit_message_text(text, reply_markup=kb))
+            except Exception:
+                pass
         return
     if data == CB_STATS_BACK:
         context.user_data.pop("_stats_waiting_range", None)
@@ -1357,6 +1398,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
+    context.user_data["_last_stats"] = (period_label, period_str, report)
     text = _format_stats_report(period_label, period_str, report)
     kb = _keyboard_stats_after_report()
     try:
