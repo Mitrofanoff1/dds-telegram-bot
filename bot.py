@@ -287,7 +287,7 @@ DEFAULT_FUND_RULES = [
     {"source": "Сбербанк", "destination": "Фонд Мастер", "percent": 30},
     {"source": "Сбербанк", "destination": "Фонд Налогов и Безопасности", "percent": 8},
     {"source": "Сбербанк", "destination": "Фонд Развития", "percent": 7},
-    {"source": "Сбербанк", "destination": "Фонд Расходов", "percent": 4},
+    {"source": "Сбербанк", "destination": "Фонд Расходов", "percent": 11},
 ]
 
 DATE_PATTERN = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*$")
