@@ -943,6 +943,14 @@ def _get_sheet_service(context: ContextTypes.DEFAULT_TYPE) -> DDSSheetService:
     return context.bot_data["sheet_service"]
 
 
+def _sheet_url():
+    """Ссылка на Google-таблицу ДДС (для кнопки «Перейти в таблицу»). None, если ID не задан."""
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return None
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+
+
 async def _build_full_balance_message():
     """Формирует текст и клавиатуру полного баланса (как /balance). Возвращает (text, reply_markup) или (None, None) при ошибке."""
     path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
@@ -988,10 +996,14 @@ async def _build_full_balance_message():
         for wallet, amount in fund_sorted:
             w_esc = _escape_html(wallet)
             lines.append(f"• {w_esc}: <b>{_format_amount(amount)} ₽</b>")
-    reply_markup = InlineKeyboardMarkup([
+    balance_buttons = [
         [InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)],
         [InlineKeyboardButton("Сформировать отчёт 📝", callback_data=CB_STATS_OPEN)],
-    ])
+    ]
+    sheet_url = _sheet_url()
+    if sheet_url:
+        balance_buttons.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
+    reply_markup = InlineKeyboardMarkup(balance_buttons)
     return "\n".join(lines), reply_markup
 
 
@@ -1024,9 +1036,12 @@ async def show_balance_button_callback(update: Update, context: ContextTypes.DEF
     text, _ = await _build_full_balance_message()
     if not text:
         return
-    keyboard_balance_back = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Назад", callback_data=CB_BALANCE_BACK)],
-    ])
+    balance_back_buttons = []
+    sheet_url = _sheet_url()
+    if sheet_url:
+        balance_back_buttons.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
+    balance_back_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=CB_BALANCE_BACK)])
+    keyboard_balance_back = InlineKeyboardMarkup(balance_back_buttons)
     try:
         await query.edit_message_text(
             text,
