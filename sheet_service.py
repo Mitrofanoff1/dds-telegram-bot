@@ -76,6 +76,8 @@ COL_DIRECTION = 6 # F
 COL_COUNTERPARTY = 7  # G
 COL_PURPOSE = 8   # H
 COL_ARTICLE = 9  # I
+COL_KIND = 11     # K «Вид д-ти»
+KIND_TECHNICAL = "Техническая операция"
 
 
 def _parse_amount(text: str) -> Optional[float]:
@@ -1052,8 +1054,18 @@ class DDSSheetService:
         ws = self._worksheet(SHEET_REGISTER)
         col_c = ws.col_values(COL_DATE)
         col_d = ws.col_values(COL_AMOUNT)
+        col_e = ws.col_values(COL_WALLET)
+        col_i = ws.col_values(COL_ARTICLE)
+        col_k = ws.col_values(COL_KIND)
+
+        def cell(col, idx):
+            return (col[idx] if idx < len(col) else "") or ""
+
         total_income = 0.0
         total_expense = 0.0
+        income_by_article: dict = {}
+        expense_by_article: dict = {}
+        funds_by_wallet: dict = {}
         for i in range(1, min(len(col_c), len(col_d))):
             d = (col_c[i] or "").strip()
             dt = parse_dt(d)
@@ -1064,17 +1076,32 @@ class DDSSheetService:
             amt = self._parse_number(str(col_d[i] or "").strip())
             if amt is None:
                 continue
+            # Переводы между своими кошельками — не доход и не расход: они
+            # только перекладывают деньги и в сумме дают ноль.
+            if cell(col_k, i).strip() == KIND_TECHNICAL:
+                wallet = cell(col_e, i).strip()
+                if amt > 0 and wallet.startswith("Фонд"):
+                    funds_by_wallet[wallet] = round(funds_by_wallet.get(wallet, 0.0) + amt, 2)
+                continue
+            article = cell(col_i, i).strip() or "Без статьи"
             if amt > 0:
                 total_income += amt
+                income_by_article[article] = round(income_by_article.get(article, 0.0) + amt, 2)
             else:
                 total_expense += abs(amt)
+                expense_by_article[article] = round(expense_by_article.get(article, 0.0) + abs(amt), 2)
         change = round(total_income - total_expense, 2)
         try:
             balances = self.get_balances(use_cache=False)
             end_balance = balances.get("Итого")
         except Exception:
             end_balance = None
-        if end_balance is not None:
+        # Баланс «было/стало» осмыслен только если период кончается сегодня:
+        # get_balances() всегда отдаёт текущий остаток, а не остаток на дату.
+        if d2.date() < datetime.now().date():
+            end_balance = None
+            start_balance = None
+        elif end_balance is not None:
             start_balance = round(end_balance - change, 2)
         else:
             start_balance = None
@@ -1084,6 +1111,9 @@ class DDSSheetService:
             "change": change,
             "revenue": round(total_income, 2),
             "expenses": round(total_expense, 2),
+            "income_by_article": income_by_article,
+            "expense_by_article": expense_by_article,
+            "funds_by_wallet": funds_by_wallet,
         }
 
     @staticmethod

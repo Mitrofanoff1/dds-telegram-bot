@@ -1089,28 +1089,60 @@ async def balance_back_callback(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
 
-def _format_stats_report(
-    period_label: str,
-    period_str: str,
-    start_balance: Optional[float],
-    end_balance: Optional[float],
-    change: float,
-    revenue: Optional[float],
-    expenses: Optional[float],
-) -> str:
-    """Формирует текст отчёта для /stats."""
-    lines = [f"📊 *{period_label}*", f"Период: {period_str}", ""]
-    if start_balance is not None:
-        lines.append(f"Начальный остаток: {_format_amount(start_balance)} ₽")
+def _format_rub(value: float) -> str:
+    """Сумма без копеек, для строк разбивки: 22 040."""
+    return f"{round(value):,}".replace(",", "\u00a0")
+
+
+def _breakdown_lines(data: dict, limit: int = 6) -> list:
+    """Строки разбивки «• статья — сумма», крупные сверху, хвост сворачивается."""
+    items = sorted((data or {}).items(), key=lambda kv: -kv[1])
+    lines = []
+    for name, amount in items[:limit]:
+        lines.append(f"   • {_escape_md(name)} — {_format_rub(amount)}")
+    tail = items[limit:]
+    if tail:
+        lines.append(f"   • и ещё {len(tail)} — {_format_rub(sum(v for _, v in tail))}")
+    return lines
+
+
+def _format_stats_report(period_label: str, period_str: str, report: dict) -> str:
+    """Текст отчёта для /stats: доходы и расходы с разбивкой, отчисления в фонды, баланс."""
+    report = report or {}
+    start_balance = report.get("start_balance")
+    end_balance = report.get("end_balance")
+    change = report.get("change", 0) or 0
+    revenue = report.get("revenue")
+    expenses = report.get("expenses")
+
+    lines = [f"📊 *ОТЧЁТ · {_escape_md(period_label.upper())}*", f"`{_escape_md(period_str)}`", ""]
+
     if revenue is not None:
-        lines.append(f"Доходы: +{_format_amount(revenue)} ₽")
+        lines.append(f"💵 *Доходы*  +{_format_rub(revenue)} ₽")
+        lines += _breakdown_lines(report.get("income_by_article"))
+        lines.append("")
     if expenses is not None:
-        lines.append(f"Расходы: -{_format_amount(expenses)} ₽")
-    change_str = _format_amount(abs(change))
+        lines.append(f"💸 *Расходы*  −{_format_rub(expenses)} ₽")
+        lines += _breakdown_lines(report.get("expense_by_article"))
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━")
     sign = "+" if change >= 0 else "−"
-    lines.append(f"Изменение: {sign}{change_str} ₽")
-    if end_balance is not None:
-        lines.append(f"Текущий баланс: {_format_amount(end_balance)} ₽")
+    lines.append(f"📈 *Итог периода*  {sign}{_format_rub(abs(change))} ₽")
+
+    funds = report.get("funds_by_wallet") or {}
+    if funds:
+        lines.append("")
+        lines.append(f"🏦 *Отложено в фонды*  {_format_rub(sum(funds.values()))} ₽")
+        lines += _breakdown_lines(funds, limit=8)
+
+    if start_balance is not None or end_balance is not None:
+        lines.append("")
+        lines.append("💰 *Баланс*")
+        if start_balance is not None:
+            lines.append(f"   было — {_format_amount(start_balance)} ₽")
+        if end_balance is not None:
+            lines.append(f"   стало — {_format_amount(end_balance)} ₽")
     return "\n".join(lines)
 
 
@@ -1213,15 +1245,7 @@ async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAUL
             pass
         return
     period_str = f"{date_from} – {date_to}"
-    text_report = _format_stats_report(
-        period_label="Диапазон",
-        period_str=period_str,
-        start_balance=report.get("start_balance"),
-        end_balance=report.get("end_balance"),
-        change=report.get("change", 0),
-        revenue=report.get("revenue"),
-        expenses=report.get("expenses"),
-    )
+    text_report = _format_stats_report("Диапазон", period_str, report)
     try:
         await update.message.reply_text(text_report, parse_mode="Markdown", reply_markup=_keyboard_stats_after_report())
     except Exception:
@@ -1333,15 +1357,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-    text = _format_stats_report(
-        period_label=period_label,
-        period_str=period_str,
-        start_balance=report.get("start_balance"),
-        end_balance=report.get("end_balance"),
-        change=report.get("change", 0),
-        revenue=report.get("revenue"),
-        expenses=report.get("expenses"),
-    )
+    text = _format_stats_report(period_label, period_str, report)
     kb = _keyboard_stats_after_report()
     try:
         await _retry_on_network(lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb))
