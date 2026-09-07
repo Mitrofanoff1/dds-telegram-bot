@@ -1219,7 +1219,6 @@ async def _build_full_balance_message():
     balance_buttons = [
         [InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)],
         [InlineKeyboardButton("Вывод Мастеру 💇", callback_data=CB_MASTER_OPEN)],
-        [InlineKeyboardButton("Вывод дивидендов 💸", callback_data=CB_PAYOUT_OPEN)],
         [InlineKeyboardButton("Сформировать отчёт 📝", callback_data=CB_STATS_OPEN)],
     ]
     sheet_url = _sheet_url()
