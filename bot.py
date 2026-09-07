@@ -1951,10 +1951,14 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
         except Exception:
             pass
         return
+    balances_after = None
+    total_after = None
     try:
         svc.invalidate_balances_cache()
+        balances_after = await asyncio.to_thread(svc.get_balances, False)
+        total_after = balances_after.pop("Итого", None)
     except Exception:
-        pass
+        balances_after = None
     for key in ("_payout_calc", "_payout_alloc", "_payout_pick", "_payout_wallets", "_payout_plan"):
         context.user_data.pop(key, None)
     # Группируем строки плана по участникам: кто сколько и с какого кошелька получил
@@ -1968,7 +1972,13 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
         for wallet, amount in parts:
             lines.append(f"   {_format_rub(amount)} — {_escape_md(wallet)}")
         lines.append("")
-    lines.append(f"Всего выведено {_format_rub(calc['payout'])} ₽, осталось {_format_rub(calc['remainder'])} ₽")
+    lines.append(f"Всего выведено {_format_rub(calc['payout'])} ₽")
+    if balances_after:
+        touched = list(dict.fromkeys(row["wallet"] for row in plan))
+        lines.append("")
+        lines.append(_format_balance_after(touched, balances_after, total_after))
+    else:
+        lines.append(f"На кошельках осталось {_format_rub(calc['remainder'])} ₽")
     kb_rows = [[InlineKeyboardButton("Показать баланс", callback_data=CB_SHOW_BALANCE)]]
     sheet_url = _sheet_url()
     if sheet_url:
