@@ -1957,10 +1957,17 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
         pass
     for key in ("_payout_calc", "_payout_alloc", "_payout_pick", "_payout_wallets", "_payout_plan"):
         context.user_data.pop(key, None)
+    # Группируем строки плана по участникам: кто сколько и с какого кошелька получил
+    by_person = {}
+    for row in plan:
+        by_person.setdefault(row["name"], []).append((row["wallet"], row["amount"]))
     lines = ["✅ *Дивиденды записаны в ДДС*", ""]
     for sh in calc["shares"]:
-        lines.append(f"   {_escape_md(sh['name'])} — *{_format_rub(sh['amount'])} ₽*")
-    lines.append("")
+        parts = by_person.get(sh["name"], [])
+        lines.append(f"*{_escape_md(sh['name'])} — {_format_rub(sh['amount'])} ₽*")
+        for wallet, amount in parts:
+            lines.append(f"   {_format_rub(amount)} — {_escape_md(wallet)}")
+        lines.append("")
     lines.append(f"Всего выведено {_format_rub(calc['payout'])} ₽, осталось {_format_rub(calc['remainder'])} ₽")
     kb_rows = [[InlineKeyboardButton("Показать баланс", callback_data=CB_SHOW_BALANCE)]]
     sheet_url = _sheet_url()
