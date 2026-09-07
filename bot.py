@@ -4,7 +4,6 @@ Telegram-бот для ввода операций ДДС в Google Таблиц
 """
 
 import asyncio
-import calendar
 import json
 import os
 import re
@@ -267,6 +266,8 @@ CB_STATS_CANCEL = "stats_cancel"
 CB_STATS_BACK = "stats_back"
 CB_STATS_RANGE = "stats_range"
 CB_STATS_OPEN = "stats_open"  # открыть выбор периода отчёта (кнопка под балансом)
+CB_STATS_YESTERDAY = "stats_yesterday"
+CB_STATS_DAY = "stats_day"          # отчёт за один произвольный день
 CB_STATS_DETAILS = "stats_details"  # раскрыть разбивку по статьям под отчётом
 CB_STATS_BRIEF = "stats_brief"      # свернуть разбивку обратно
 CB_SETTINGS_ADD_WALLET = "settings_add_wallet"
@@ -1158,10 +1159,16 @@ def _keyboard_stats_period() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Сегодня", callback_data=CB_STATS_TODAY),
+            InlineKeyboardButton("Вчера", callback_data=CB_STATS_YESTERDAY),
+        ],
+        [
             InlineKeyboardButton("Неделя", callback_data=CB_STATS_WEEK),
             InlineKeyboardButton("Месяц", callback_data=CB_STATS_MONTH),
         ],
-        [InlineKeyboardButton("Ввести диапазон", callback_data=CB_STATS_RANGE)],
+        [
+            InlineKeyboardButton("📆 Другой день", callback_data=CB_STATS_DAY),
+            InlineKeyboardButton("📅 Диапазон", callback_data=CB_STATS_RANGE),
+        ],
         [InlineKeyboardButton("Отмена ❌", callback_data=CB_STATS_CANCEL)],
     ])
 
@@ -1192,6 +1199,22 @@ async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAUL
     """Обработка пошагового ввода диапазона дат: сначала «с какой даты», потом «до какой даты»."""
     uid = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
+    if context.user_data.get("_stats_waiting_day"):
+        parsed = _validate_date(text)
+        if not parsed:
+            try:
+                await update.message.reply_text("Неверный формат. Введите дату в формате ДД.ММ.ГГГГ (например 05.09.2026):")
+            except Exception:
+                pass
+            if uid is not None:
+                _stats_waiting_user_ids.add(uid)
+            return
+        context.user_data.pop("_stats_waiting_day", None)
+        if uid is not None:
+            _stats_waiting_user_ids.discard(uid)
+        await _deliver_stats_report(update, context, "День", parsed, parsed)
+        return
+
     date_from = context.user_data.get("_stats_date_from")
 
     if date_from is None:
@@ -1236,6 +1259,11 @@ async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAUL
     context.user_data.pop("_stats_date_from", None)
     if uid is not None:
         _stats_waiting_user_ids.discard(uid)
+    await _deliver_stats_report(update, context, "Диапазон", date_from, date_to)
+
+
+async def _deliver_stats_report(update, context, period_label: str, date_from: str, date_to: str):
+    """Собирает отчёт за период и отправляет его ответным сообщением."""
     try:
         svc = _get_sheet_service(context)
     except Exception as e:
@@ -1258,9 +1286,9 @@ async def stats_range_input_handler(update: Update, context: ContextTypes.DEFAUL
         except Exception:
             pass
         return
-    period_str = f"{date_from} – {date_to}"
-    context.user_data["_last_stats"] = ("Диапазон", period_str, report)
-    text_report = _format_stats_report("Диапазон", period_str, report)
+    period_str = date_from if date_from == date_to else f"{date_from} – {date_to}"
+    context.user_data["_last_stats"] = (period_label, period_str, report)
+    text_report = _format_stats_report(period_label, period_str, report)
     try:
         await update.message.reply_text(text_report, parse_mode="Markdown", reply_markup=_keyboard_stats_after_report())
     except Exception:
@@ -1327,6 +1355,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == CB_STATS_BACK:
         context.user_data.pop("_stats_waiting_range", None)
+        context.user_data.pop("_stats_waiting_day", None)
         context.user_data.pop("_stats_date_from", None)
         uid = update.effective_user.id if update.effective_user else None
         if uid is not None:
@@ -1338,8 +1367,25 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
+    if data == CB_STATS_DAY:
+        context.user_data["_stats_waiting_day"] = True
+        context.user_data.pop("_stats_waiting_range", None)
+        context.user_data.pop("_stats_date_from", None)
+        uid = update.effective_user.id if update.effective_user else None
+        if uid is not None:
+            _stats_waiting_user_ids.add(uid)
+        try:
+            await _retry_on_network(
+                lambda: query.edit_message_text(
+                    "Введите дату (ДД.ММ.ГГГГ):", reply_markup=_keyboard_stats_waiting_range()
+                )
+            )
+        except Exception:
+            pass
+        return
     if data == CB_STATS_RANGE:
         context.user_data["_stats_waiting_range"] = True
+        context.user_data.pop("_stats_waiting_day", None)
         context.user_data.pop("_stats_date_from", None)
         uid = update.effective_user.id if update.effective_user else None
         if uid is not None:
@@ -1381,15 +1427,20 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year}"
         period_str = f"{from_str} – {today_str}"
         report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, today_str)
+    elif data == CB_STATS_YESTERDAY:
+        period_label = "Вчера"
+        y = today - timedelta(days=1)
+        y_str = f"{y.day:02d}.{y.month:02d}.{y.year}"
+        period_str = y_str
+        report = await asyncio.to_thread(svc.get_summary_for_date_range, y_str, y_str)
     elif data == CB_STATS_MONTH:
+        # Считаем по журналу операций, а не по листу «ДДС: Сводный»: там нет
+        # разбивки по статьям, а доходы и расходы читаются неверно.
         period_label = "Месяц"
-        month = today.month
-        year = today.year
-        from_d = date(year, month, 1)
-        last_day = calendar.monthrange(year, month)[1]
-        to_d = date(year, month, last_day)
-        period_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year} – {to_d.day:02d}.{to_d.month:02d}.{to_d.year}"
-        report = await asyncio.to_thread(svc.get_summary_for_month, month)
+        from_d = date(today.year, today.month, 1)
+        from_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year}"
+        period_str = f"{from_str} – {today_str}"
+        report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, today_str)
     if report is None:
         try:
             await _retry_on_network(
