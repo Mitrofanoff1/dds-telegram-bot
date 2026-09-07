@@ -33,7 +33,7 @@ from telegram.ext import (
 # Состояния диалога ловят кнопки с динамическими данными (индексы кошельков,
 # статей), поэтому позитивный фильтр им не подходит. Этот — отсекает чужие
 # кнопки, чтобы брошенный на середине диалог не глотал отчёты и настройки.
-CB_NOT_OTHER_SECTIONS = re.compile(r"^(?!stats_|payout_|payset_|master_|settings|sf_)")
+CB_NOT_OTHER_SECTIONS = re.compile(r"^(?!stats_|payout_|payset_|paycal_|master_|settings|sf_)")
 
 
 def _parse_allowed_user_ids() -> set:
@@ -282,6 +282,8 @@ CB_STATS_CANCEL = "stats_cancel"
 CB_STATS_BACK = "stats_back"
 CB_STATS_RANGE = "stats_range"
 CB_STATS_OPEN = "stats_open"  # открыть выбор периода отчёта (кнопка под балансом)
+CB_PAYCAL_OPEN = "paycal_open"
+CB_PAYCAL_BACK = "paycal_back"
 CB_PAYSET_OPEN = "payset_open"
 CB_PAYSET_CLOSE = "payset_close"
 CB_PAYSET_RESERVE = "payset_reserve"
@@ -2442,6 +2444,37 @@ async def _reminders_loop(application) -> None:
 
 async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /payments — платёжный календарь на текущий месяц."""
+    try:
+        text = await _build_payment_calendar_text(context)
+        kb = await _keyboard_payment_calendar(context)
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        try:
+            await update.message.reply_text(_format_sheet_error(e))
+        except Exception:
+            pass
+
+
+async def _keyboard_payment_calendar(context, with_back: bool = False) -> InlineKeyboardMarkup:
+    """Под календарём: ссылка прямо на лист и, если открыт из настроек, возврат."""
+    rows = []
+    base = _sheet_url()
+    if base:
+        gid = None
+        try:
+            svc = _get_sheet_service(context)
+            gid = await asyncio.to_thread(svc.get_payments_sheet_gid)
+        except Exception:
+            gid = None
+        url = f"{base}#gid={gid}" if gid is not None else base
+        rows.append([InlineKeyboardButton("Настроить в таблице 📊", url=url)])
+    if with_back:
+        rows.append([InlineKeyboardButton("🔙 Назад", callback_data=CB_PAYCAL_BACK)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _build_payment_calendar_text(context) -> str:
+    """Текст платёжного календаря на текущий месяц."""
     today = date.today()
     lines = [f"📅 *ПЛАТЁЖНЫЙ КАЛЕНДАРЬ* · {MONTHS_RU[today.month - 1]}", ""]
     for payment in await _get_payments(context):
@@ -2470,10 +2503,30 @@ async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(row)
     lines.append("")
     lines.append(f"_Напоминания приходят в {REMINDER_HOUR}:00 по Москве._")
+    return "\n".join(lines)
+
+
+async def payment_calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Платёжный календарь» в настройках."""
+    query = update.callback_query
     try:
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _retry_on_network(lambda: query.answer())
     except Exception:
         pass
+    if query.data == CB_PAYCAL_BACK:
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                "⚙️ **Настройки**\n\nВыберите раздел:", reply_markup=_keyboard_settings(), parse_mode="Markdown"
+            ))
+        except Exception:
+            pass
+        return
+    try:
+        text = await _build_payment_calendar_text(context)
+        kb = await _keyboard_payment_calendar(context, with_back=True)
+        await _retry_on_network(lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb))
+    except Exception as e:
+        await _alert(query, f"Не удалось открыть календарь: {e}")
 
 
 def _keyboard_master_cancel() -> InlineKeyboardMarkup:
@@ -3050,6 +3103,7 @@ def _keyboard_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Настройка отчислений в фонды", callback_data=CB_SETTINGS_FUNDS)],
         [InlineKeyboardButton("Правила вывода дивидендов", callback_data=CB_PAYSET_OPEN)],
+        [InlineKeyboardButton("Платёжный календарь", callback_data=CB_PAYCAL_OPEN)],
         [InlineKeyboardButton("Добавить новый кошелёк", callback_data=CB_SETTINGS_ADD_WALLET)],
         [InlineKeyboardButton("🔙 Назад", callback_data=CB_SETTINGS_BACK)],
     ])
@@ -4710,6 +4764,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(payout_callback, pattern="^payout_"))
     app.add_handler(CallbackQueryHandler(master_callback, pattern="^master_"))
     app.add_handler(CallbackQueryHandler(payout_settings_callback, pattern="^payset_"))
+    app.add_handler(CallbackQueryHandler(payment_calendar_callback, pattern="^paycal_"))
     # Кнопка «Показать баланс» после внесения операции (показ в том же окне)
     app.add_handler(CallbackQueryHandler(show_balance_button_callback, pattern=f"^{re.escape(CB_SHOW_BALANCE)}$"))
     # Кнопка «🔙 Назад» в окне баланса (вернуться к «Операция внесена»)
@@ -4746,7 +4801,6 @@ def main() -> None:
                 BotCommand("master", "Вывод мастеру"),
                 BotCommand("dividends", "Вывод дивидендов"),
                 BotCommand("funds", "Рассчитать фонды"),
-                BotCommand("payments", "Платёжный календарь"),
                 BotCommand("stats", "Отчёт ДДС"),
                 BotCommand("settings", "Настройки"),
             ])

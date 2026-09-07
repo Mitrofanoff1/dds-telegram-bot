@@ -1046,6 +1046,13 @@ class DDSSheetService:
             "expenses": expenses,
         }
 
+    def get_payments_sheet_gid(self) -> Optional[int]:
+        """gid листа «Платёжный календарь» — чтобы ссылка открывала сразу его."""
+        try:
+            return self._worksheet(SHEET_PAYMENTS).id
+        except Exception:
+            return None
+
     def get_payment_calendar(self) -> list:
         """
         Регулярные платежи из листа «Платёжный календарь».
