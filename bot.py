@@ -88,6 +88,7 @@ _settings_waiting_user_ids = set()
 _stats_waiting_user_ids = set()  # ожидание ввода диапазона дат для /stats
 _payout_waiting_user_ids = set()  # ожидание ручного ввода суммы при выводе дивидендов
 _payset_waiting_user_ids = set()  # ожидание ввода в настройках вывода дивидендов
+_master_waiting_user_ids = set()  # ожидание суммы выплаты мастеру
 
 # Защита от дублей: не слать меню /settings повторно, если уже отправили недавно (сетевой сбой → пользователь жмёт несколько раз)
 _settings_cmd_last_sent: dict[int, float] = {}
@@ -185,6 +186,8 @@ def _text_form_should_handle(update: Update) -> bool:
         return True
     if user_id is not None and user_id in _payset_waiting_user_ids:
         return True
+    if user_id is not None and user_id in _master_waiting_user_ids:
+        return True
     return _is_one_window_message(update.message.text)
 
 
@@ -281,6 +284,10 @@ CB_PAYSET_RENT_TOGGLE = "payset_rent"
 CB_PAYSET_P_PREFIX = "payset_p_"
 CB_PAYSET_PNAME_PREFIX = "payset_pn_"
 CB_PAYSET_PSHARE_PREFIX = "payset_ps_"
+CB_MASTER_OPEN = "master_open"
+CB_MASTER_ALL = "master_all"
+CB_MASTER_CONFIRM = "master_confirm"
+CB_MASTER_CANCEL = "master_cancel"
 CB_PAYOUT_OPEN = "payout_open"
 CB_PAYOUT_MANUAL = "payout_manual"
 CB_PAYOUT_MW_PREFIX = "payout_mw_"
@@ -405,6 +412,8 @@ DEFAULT_PAYOUT_RULES = {
     "source_wallets": ["Сбербанк", "Касса"],
     "require_rent_paid": True,
     "rent_article": "Аренда помещения и КУ",
+    "master_wallet": "Фонд Мастер",
+    "master_article": "Фонд оплаты труда (ФОТ)",
     "participants": [
         {"name": "Участник 1", "share": 50.0},
         {"name": "Участник 2", "share": 50.0},
@@ -704,6 +713,10 @@ async def handle_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ожидание ввода в настройках вывода дивидендов
     if user_id is not None and user_id in _payset_waiting_user_ids:
         await payout_settings_input(update, context)
+        return
+    # Ожидание суммы выплаты мастеру
+    if user_id is not None and user_id in _master_waiting_user_ids:
+        await master_amount_input(update, context)
         return
     # Ожидание ввода в настройках (отчисления в фонды или название нового кошелька)
     if user_id is not None and user_id in _settings_waiting_user_ids:
@@ -1207,6 +1220,7 @@ async def _build_full_balance_message():
     balance_buttons = [
         [InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)],
         [InlineKeyboardButton("Вывод дивидендов 💸", callback_data=CB_PAYOUT_OPEN)],
+        [InlineKeyboardButton("Вывод Мастеру 💇", callback_data=CB_MASTER_OPEN)],
         [InlineKeyboardButton("Сформировать отчёт 📝", callback_data=CB_STATS_OPEN)],
     ]
     sheet_url = _sheet_url()
@@ -2188,6 +2202,233 @@ async def payout_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     left = _payout_left_to_allocate(context)
     amount = round(min(amount, left), 2)  # больше, чем нужно вывести, не берём
     await _payout_allocate(context, None, wallet, amount, message=update.message)
+
+
+def _keyboard_master_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Отмена ❌", callback_data=CB_MASTER_CANCEL)]])
+
+
+async def _master_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_query=None):
+    """Экран «Вывод Мастеру»: остаток фонда и запрос суммы."""
+    rules = _get_payout_rules(context)
+    wallet = str(rules.get("master_wallet") or DEFAULT_PAYOUT_RULES["master_wallet"])
+
+    async def reply(text, kb):
+        if edit_query is not None:
+            try:
+                await _retry_on_network(lambda: edit_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb))
+            except Exception:
+                pass
+        else:
+            try:
+                await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            except Exception:
+                pass
+
+    try:
+        svc = _get_sheet_service(context)
+        balances = await asyncio.to_thread(svc.get_balances, False)
+    except Exception as e:
+        await reply(_format_sheet_error(e), None)
+        return
+    available = float(balances.get(wallet, 0) or 0)
+    context.user_data["_master_available"] = available
+    if available <= 0:
+        await reply(
+            f"💇 *ВЫВОД МАСТЕРУ* · {_today_str()}\n\n"
+            f"*{_escape_md(wallet)}: {_format_amount(available)} ₽*\n\nВыводить нечего.",
+            _keyboard_master_cancel(),
+        )
+        return
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is not None:
+        _master_waiting_user_ids.add(uid)
+    rows = [
+        [InlineKeyboardButton(f"Вывести всё: {_format_rub(available)} ₽", callback_data=CB_MASTER_ALL)],
+        [InlineKeyboardButton("Отмена ❌", callback_data=CB_MASTER_CANCEL)],
+    ]
+    await reply(
+        f"💇 *ВЫВОД МАСТЕРУ* · {_today_str()}\n\n"
+        f"*{_escape_md(wallet)}: {_format_amount(available)} ₽*\n"
+        "_доступно к выводу_\n\n"
+        "Сколько выводим? Введите сумму:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+def _format_master_confirm(wallet: str, article: str, amount: float, available: float) -> str:
+    return (
+        "✅ *ПРОВЕРЬТЕ ПЕРЕД ЗАПИСЬЮ*\n\n"
+        f"Выплата мастеру: *{_format_rub(amount)} ₽*\n"
+        f"Кошелёк: {_escape_md(wallet)}\n"
+        f"Статья: {_escape_md(article)}\n\n"
+        f"В фонде останется {_format_amount(available - amount)} ₽"
+    )
+
+
+def _keyboard_master_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Подтвердить списание ✅", callback_data=CB_MASTER_CONFIRM)],
+        [InlineKeyboardButton("Изменить сумму 💰", callback_data=CB_MASTER_OPEN)],
+        [InlineKeyboardButton("Отмена ❌", callback_data=CB_MASTER_CANCEL)],
+    ])
+
+
+async def master_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ввод суммы выплаты мастеру."""
+    uid = update.effective_user.id if update.effective_user else None
+    rules = _get_payout_rules(context)
+    wallet = str(rules.get("master_wallet") or DEFAULT_PAYOUT_RULES["master_wallet"])
+    article = str(rules.get("master_article") or DEFAULT_PAYOUT_RULES["master_article"])
+    available = float(context.user_data.get("_master_available", 0) or 0)
+    amount = DDSSheetService.parse_amount((update.message.text or "").replace(",", "."))
+    if amount is None or amount <= 0:
+        try:
+            await update.message.reply_text("Не понял сумму. Сколько выводим? Введите число.")
+        except Exception:
+            pass
+        return
+    amount = round(float(amount), 2)
+    if amount > available + 0.004:
+        try:
+            await update.message.reply_text(_format_not_enough(wallet, amount, available), parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+    context.user_data["_master_amount"] = amount
+    if uid is not None:
+        _master_waiting_user_ids.discard(uid)
+    try:
+        await update.message.reply_text(
+            _format_master_confirm(wallet, article, amount, available),
+            parse_mode="Markdown",
+            reply_markup=_keyboard_master_confirm(),
+        )
+    except Exception:
+        pass
+
+
+async def _master_write(context: ContextTypes.DEFAULT_TYPE, query):
+    """Записывает выплату мастеру в ДДС."""
+    rules = _get_payout_rules(context)
+    wallet = str(rules.get("master_wallet") or DEFAULT_PAYOUT_RULES["master_wallet"])
+    article = str(rules.get("master_article") or DEFAULT_PAYOUT_RULES["master_article"])
+    amount = float(context.user_data.get("_master_amount", 0) or 0)
+    if amount <= 0:
+        try:
+            await _retry_on_network(lambda: query.edit_message_text("Сумма не задана — начните заново."))
+        except Exception:
+            pass
+        return
+    ok, balance = await _wallet_has_funds(context, wallet, amount)
+    if not ok:
+        await _send_not_enough(query, wallet, amount, balance)
+        return
+    svc = _get_sheet_service(context)
+    try:
+        direction = await asyncio.to_thread(svc.get_default_business_direction)
+    except Exception:
+        direction = ""
+    month = MONTHS_RU[date.today().month - 1]
+    try:
+        await asyncio.to_thread(
+            svc.append_operation,
+            _today_str(),
+            -abs(amount),
+            wallet,
+            direction or "",
+            "",
+            f"Выплата мастеру за {month}",
+            article,
+        )
+    except Exception as e:
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                "⚠️ Записать не удалось: " + _escape_md(str(e).split("\n")[0][:200])
+            ))
+        except Exception:
+            pass
+        return
+    balances_after = None
+    total_after = None
+    try:
+        svc.invalidate_balances_cache()
+        balances_after = await asyncio.to_thread(svc.get_balances, False)
+        total_after = balances_after.pop("Итого", None)
+    except Exception:
+        balances_after = None
+    for key in ("_master_available", "_master_amount"):
+        context.user_data.pop(key, None)
+    lines = ["✅ *Выплата мастеру записана в ДДС*", "", f"Выплачено {_format_rub(amount)} ₽", f"Статья: {_escape_md(article)}"]
+    if balances_after:
+        lines.append("")
+        lines.append("📊 *Баланс после операции:*")
+        lines.append(f"• {_escape_md(wallet)}: {_format_amount(balances_after.get(wallet, 0))} ₽")
+        if total_after is not None:
+            lines.append("")
+            lines.append(f"ОБЩИЙ БАЛАНС: *{_format_amount(total_after)} ₽*")
+    kb_rows = [[InlineKeyboardButton("Показать баланс", callback_data=CB_SHOW_BALANCE)]]
+    sheet_url = _sheet_url()
+    if sheet_url:
+        kb_rows.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
+    try:
+        await _retry_on_network(lambda: query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb_rows)
+        ))
+    except Exception:
+        pass
+
+
+async def master_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /master — выплата мастеру из фонда."""
+    await _master_start(update, context)
+
+
+async def master_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки выплаты мастеру."""
+    query = update.callback_query
+    try:
+        await _retry_on_network(lambda: query.answer())
+    except Exception:
+        pass
+    data = query.data
+    uid = update.effective_user.id if update.effective_user else None
+    if data == CB_MASTER_CANCEL:
+        for key in ("_master_available", "_master_amount"):
+            context.user_data.pop(key, None)
+        if uid is not None:
+            _master_waiting_user_ids.discard(uid)
+        try:
+            await _retry_on_network(lambda: query.edit_message_text("Выплата отменена."))
+        except Exception:
+            pass
+        return
+    if data == CB_MASTER_OPEN:
+        await _master_start(update, context, edit_query=query)
+        return
+    if data == CB_MASTER_ALL:
+        available = float(context.user_data.get("_master_available", 0) or 0)
+        if available <= 0:
+            await _master_start(update, context, edit_query=query)
+            return
+        rules = _get_payout_rules(context)
+        wallet = str(rules.get("master_wallet") or DEFAULT_PAYOUT_RULES["master_wallet"])
+        article = str(rules.get("master_article") or DEFAULT_PAYOUT_RULES["master_article"])
+        context.user_data["_master_amount"] = available
+        if uid is not None:
+            _master_waiting_user_ids.discard(uid)
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                _format_master_confirm(wallet, article, available, available),
+                parse_mode="Markdown",
+                reply_markup=_keyboard_master_confirm(),
+            ))
+        except Exception:
+            pass
+        return
+    if data == CB_MASTER_CONFIRM:
+        await _master_write(context, query)
+        return
 
 
 def _format_payout_settings(rules: dict) -> str:
@@ -4209,6 +4450,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("funds", funds_cmd))
     app.add_handler(CommandHandler("dividends", dividends_cmd))
+    app.add_handler(CommandHandler("master", master_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("text", text_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
@@ -4217,6 +4459,7 @@ def main() -> None:
     # Отчёт /stats
     app.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats_"))
     app.add_handler(CallbackQueryHandler(payout_callback, pattern="^payout_"))
+    app.add_handler(CallbackQueryHandler(master_callback, pattern="^master_"))
     app.add_handler(CallbackQueryHandler(payout_settings_callback, pattern="^payset_"))
     # Кнопка «Показать баланс» после внесения операции (показ в том же окне)
     app.add_handler(CallbackQueryHandler(show_balance_button_callback, pattern=f"^{re.escape(CB_SHOW_BALANCE)}$"))
@@ -4252,6 +4495,7 @@ def main() -> None:
                 BotCommand("balance", "Показать балансы"),
                 BotCommand("text", "Текстовый ввод операции"),
                 BotCommand("dividends", "Вывод дивидендов"),
+                BotCommand("master", "Вывод Мастеру"),
                 BotCommand("funds", "Рассчитать фонды"),
                 BotCommand("stats", "Отчёт ДДС"),
                 BotCommand("settings", "Настройки"),
