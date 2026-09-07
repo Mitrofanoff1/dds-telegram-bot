@@ -2234,8 +2234,23 @@ def _reminders_state_path() -> str:
     return os.getenv("REMINDERS_STATE_PATH", os.path.join(os.path.dirname(__file__) or ".", "reminders_state.json"))
 
 
-def _get_payments() -> list:
-    """Платёжный календарь из JSON, иначе значения по умолчанию."""
+async def _get_payments(context) -> list:
+    """
+    Платёжный календарь из листа «Платёжный календарь» таблицы ДДС.
+    Если листа нет или он пуст — из JSON, иначе значения по умолчанию.
+    """
+    try:
+        svc = _get_sheet_service(context)
+        from_sheet = await asyncio.to_thread(svc.get_payment_calendar)
+        if from_sheet:
+            return from_sheet
+    except Exception:
+        pass
+    return _get_payments_fallback()
+
+
+def _get_payments_fallback() -> list:
+    """Запасной источник календаря: JSON рядом с ботом, иначе значения по умолчанию."""
     path = _payments_path()
     if os.path.isfile(path):
         try:
@@ -2328,7 +2343,7 @@ async def _send_due_reminders(application, today: date, force: bool = False) -> 
     state = _load_reminders_state()
     today_key = today.isoformat()
     sent = 0
-    for payment in _get_payments():
+    for payment in await _get_payments(context):
         due = _payment_due_date(payment, today)
         if due is None:
             continue
@@ -2355,12 +2370,17 @@ async def _send_due_reminders(application, today: date, force: bool = False) -> 
 
 
 async def _reminders_loop(application) -> None:
-    """Раз в минуту проверяет, не пора ли слать напоминания о платежах."""
+    """
+    Раз в минуту смотрит на часы. Разбор календаря делаем один раз в день,
+    после REMINDER_HOUR, — незачем дёргать таблицу каждую минуту.
+    """
+    checked_date = None
     while True:
         try:
             now = datetime.now()
-            if now.hour >= REMINDER_HOUR:
+            if now.hour >= REMINDER_HOUR and checked_date != now.date():
                 await _send_due_reminders(application, now.date())
+                checked_date = now.date()
         except Exception:
             pass
         await asyncio.sleep(60)
@@ -2370,7 +2390,7 @@ async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /payments — платёжный календарь на текущий месяц."""
     today = date.today()
     lines = [f"📅 *ПЛАТЁЖНЫЙ КАЛЕНДАРЬ* · {MONTHS_RU[today.month - 1]}", ""]
-    for payment in _get_payments():
+    for payment in await _get_payments(context):
         due = _payment_due_date(payment, today)
         if due is None:
             continue
@@ -2386,10 +2406,14 @@ async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark, note = "•", f"через {days_left} дн."
         amount = payment.get("amount")
         amount_str = f" — {_format_rub(float(amount))} ₽" if amount else ""
-        lines.append(
+        row = (
             f"{mark} *{_escape_md(str(payment.get('name', '')))}*{amount_str}\n"
             f"   {due.day:02d}.{due.month:02d}, {note}"
         )
+        wallet = (payment.get("wallet") or "").strip()
+        if wallet:
+            row += f" · {_escape_md(wallet)}"
+        lines.append(row)
     lines.append("")
     lines.append(f"_Напоминания приходят в {REMINDER_HOUR}:00 по Москве._")
     try:

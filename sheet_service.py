@@ -21,6 +21,7 @@ from gspread.utils import ValueRenderOption
 
 # Листы таблицы
 SHEET_REGISTER = "ДДС: месяц"  # реестр операций
+SHEET_PAYMENTS = "Платёжный календарь"  # регулярные платежи для напоминаний
 SHEET_WALLETS = "ДДС: настройки (для ввода сальдо)"
 SHEET_DIRECTIONS = "Справочники"
 SHEET_ARTICLES = "ДДС: статьи"
@@ -1044,6 +1045,67 @@ class DDSSheetService:
             "revenue": revenue,
             "expenses": expenses,
         }
+
+    def get_payment_calendar(self) -> list:
+        """
+        Регулярные платежи из листа «Платёжный календарь».
+        Шапка в строке 2, данные с третьей: Платёж | День | Сумма | Статья |
+        Кошелёк | Напомнить за (дней) | Активен | Комментарий.
+        Пустой список — листа нет или он не заполнен.
+        """
+        try:
+            ws = self._worksheet(SHEET_PAYMENTS)
+        except Exception:
+            return []
+        try:
+            grid = _retry_sheets_fetch(lambda: ws.get_all_values())
+        except Exception:
+            return []
+
+        def cell(row, i):
+            return (row[i] if i < len(row) else "").strip()
+
+        out = []
+        for row in grid[2:]:
+            name = cell(row, 0)
+            if not name:
+                continue
+            active = cell(row, 6).lower()
+            if active in ("нет", "no", "false", "0"):
+                continue
+            day_raw = cell(row, 1).lower()
+            if day_raw.startswith("послед"):
+                day = "last"
+            else:
+                try:
+                    day = int(float(day_raw.replace(",", ".")))
+                except ValueError:
+                    continue  # без дня напоминать не о чем
+            amount = self._parse_number(cell(row, 2)) or 0.0
+            remind_raw = cell(row, 5)
+            remind = []
+            for part in remind_raw.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    remind.append(int(float(part.replace(",", "."))))
+                except ValueError:
+                    pass
+            if not remind:
+                remind = [1]
+            if 0 not in remind:
+                remind.append(0)  # в день платежа напоминаем всегда
+            out.append({
+                "name": name,
+                "day": day,
+                "amount": amount,
+                "article": cell(row, 3),
+                "wallet": cell(row, 4),
+                "remind_days": sorted(set(remind), reverse=True),
+                "comment": cell(row, 7),
+            })
+        return out
 
     def get_summary_for_date_range(self, date_from: str, date_to: str) -> Optional[dict]:
         """
