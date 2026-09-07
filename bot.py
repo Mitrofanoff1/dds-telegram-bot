@@ -1759,11 +1759,11 @@ def _payout_auto_split(calc: dict, rules: dict) -> dict:
 
 
 def _format_payout_screen(calc: dict, rules: dict, rent_note: str = "") -> str:
-    """Экран расчёта дивидендов — коротко: сколько выводим и кому."""
+    """Экран расчёта дивидендов: сумма, доли, списание, баланс кошельков, резерв."""
     lines = [f"💸 *ВЫВОД ДИВИДЕНДОВ* · {_today_str()}", ""]
     lines.append(f"💰 *К выводу — {_format_rub(calc['payout'])} ₽*")
     for sh in calc["shares"]:
-        lines.append(f"   {_escape_md(sh['name'])} — *{_format_rub(sh['amount'])} ₽*")
+        lines.append(f"   {_escape_md(sh['name'])} — {_format_rub(sh['amount'])} ₽")
     split = calc.get("split") or {}
     if split:
         lines.append("")
@@ -1771,10 +1771,11 @@ def _format_payout_screen(calc: dict, rules: dict, rent_note: str = "") -> str:
         for wallet, amount in split.items():
             lines.append(f"   {_format_rub(amount)} — {_escape_md(wallet)}")
     lines.append("")
-    lines.append(
-        f"_На кошельках {_format_rub(calc['liquid'])}, резерв {_format_rub(calc['reserve'])}, "
-        f"останется {_format_rub(calc['remainder'])}._"
-    )
+    lines.append(f"💸 *Баланс кошельков: {_format_amount(calc['liquid'])} ₽*")
+    for wallet, amount in calc["per_wallet"].items():
+        lines.append(f"• {_escape_md(wallet)}: {_format_amount(amount)} ₽")
+    lines.append("")
+    lines.append(f"Резерв: {_format_rub(calc['reserve'])} ₽")
     if rent_note:
         lines.append("")
         lines.append(rent_note)
@@ -1977,6 +1978,7 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
             pass
         return
     svc = _get_sheet_service(context)
+    rules = _get_payout_rules(context)
     # Между расчётом и подтверждением баланс мог измениться — проверяем заново
     need_by_wallet = {}
     for row in plan:
@@ -2032,16 +2034,20 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
         by_person.setdefault(row["name"], []).append((row["wallet"], row["amount"]))
     lines = ["✅ *Дивиденды записаны в ДДС*", ""]
     for sh in calc["shares"]:
-        parts = by_person.get(sh["name"], [])
-        lines.append(f"*{_escape_md(sh['name'])} — {_format_rub(sh['amount'])} ₽*")
-        for wallet, amount in parts:
-            lines.append(f"   {_format_rub(amount)} — {_escape_md(wallet)}")
+        lines.append(f"*{_escape_md(sh['name'])} к получению:*")
+        for wallet, amount in by_person.get(sh["name"], []):
+            lines.append(f"   {_format_rub(amount)} ₽ — {_escape_md(wallet)}")
         lines.append("")
     lines.append(f"Всего выведено {_format_rub(calc['payout'])} ₽")
     if balances_after:
-        touched = list(dict.fromkeys(row["wallet"] for row in plan))
         lines.append("")
-        lines.append(_format_balance_after(touched, balances_after, total_after))
+        lines.append("📊 *Баланс кошельков после операции:*")
+        for wallet in (rules.get("source_wallets") or []):
+            if wallet in balances_after:
+                lines.append(f"• {_escape_md(wallet)}: {_format_amount(balances_after[wallet])} ₽")
+        if total_after is not None:
+            lines.append("")
+            lines.append(f"ОБЩИЙ БАЛАНС: *{_format_amount(total_after)} ₽*")
     else:
         lines.append(f"На кошельках осталось {_format_rub(calc['remainder'])} ₽")
     kb_rows = [[InlineKeyboardButton("Показать баланс", callback_data=CB_SHOW_BALANCE)]]
