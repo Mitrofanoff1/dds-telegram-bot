@@ -285,7 +285,6 @@ CB_PAYSET_P_PREFIX = "payset_p_"
 CB_PAYSET_PNAME_PREFIX = "payset_pn_"
 CB_PAYSET_PSHARE_PREFIX = "payset_ps_"
 CB_MASTER_OPEN = "master_open"
-CB_MASTER_ALL = "master_all"
 CB_MASTER_CONFIRM = "master_confirm"
 CB_MASTER_CANCEL = "master_cancel"
 CB_PAYOUT_OPEN = "payout_open"
@@ -2243,16 +2242,12 @@ async def _master_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
     uid = update.effective_user.id if update.effective_user else None
     if uid is not None:
         _master_waiting_user_ids.add(uid)
-    rows = [
-        [InlineKeyboardButton(f"Вывести всё: {_format_rub(available)} ₽", callback_data=CB_MASTER_ALL)],
-        [InlineKeyboardButton("Отмена ❌", callback_data=CB_MASTER_CANCEL)],
-    ]
     await reply(
         f"💇 *ВЫВОД МАСТЕРУ* · {_today_str()}\n\n"
         f"*{_escape_md(wallet)}: {_format_amount(available)} ₽*\n"
         "_доступно к выводу_\n\n"
         "Сколько выводим? Введите сумму:",
-        InlineKeyboardMarkup(rows),
+        _keyboard_master_cancel(),
     )
 
 
@@ -2405,26 +2400,6 @@ async def master_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == CB_MASTER_OPEN:
         await _master_start(update, context, edit_query=query)
-        return
-    if data == CB_MASTER_ALL:
-        available = float(context.user_data.get("_master_available", 0) or 0)
-        if available <= 0:
-            await _master_start(update, context, edit_query=query)
-            return
-        rules = _get_payout_rules(context)
-        wallet = str(rules.get("master_wallet") or DEFAULT_PAYOUT_RULES["master_wallet"])
-        article = str(rules.get("master_article") or DEFAULT_PAYOUT_RULES["master_article"])
-        context.user_data["_master_amount"] = available
-        if uid is not None:
-            _master_waiting_user_ids.discard(uid)
-        try:
-            await _retry_on_network(lambda: query.edit_message_text(
-                _format_master_confirm(wallet, article, available, available),
-                parse_mode="Markdown",
-                reply_markup=_keyboard_master_confirm(),
-            ))
-        except Exception:
-            pass
         return
     if data == CB_MASTER_CONFIRM:
         await _master_write(context, query)
