@@ -303,6 +303,8 @@ CB_PAYOUT_MALL = "payout_mall"
 CB_PAYOUT_CONFIRM = "payout_confirm"
 CB_PAYOUT_BACK = "payout_back"
 CB_PAYOUT_CANCEL = "payout_cancel"
+CB_STATS_WEEK_PREFIX = "stats_wk_"   # + сдвиг: 0 текущая неделя, 1 предыдущая
+CB_STATS_MONTH_PREFIX = "stats_mo_"  # + сдвиг: 0 текущий месяц, 1 предыдущий
 CB_STATS_YESTERDAY = "stats_yesterday"
 CB_STATS_DAY = "stats_day"          # меню выбора конкретного дня
 CB_STATS_DAY_PREFIX = "stats_d_"    # + ДД.ММ.ГГГГ — отчёт за этот день
@@ -1426,14 +1428,48 @@ def _keyboard_stats_waiting_range() -> InlineKeyboardMarkup:
     ])
 
 
-def _keyboard_stats_after_report(detailed: bool = False) -> InlineKeyboardMarkup:
-    """Клавиатура под отчётом: раскрыть/свернуть статьи, Добавить операцию, Назад."""
+def _week_range(offset: int) -> tuple:
+    """Календарная неделя со сдвигом назад: 0 — текущая (по сегодня), 1 — прошлая."""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday() + 7 * offset)
+    end = min(monday + timedelta(days=6), today)
+    return monday, end
+
+
+def _month_range(offset: int) -> tuple:
+    """Месяц со сдвигом назад: 0 — текущий (по сегодня), 1 — прошлый."""
+    today = date.today()
+    year, month = today.year, today.month - offset
+    while month < 1:
+        month += 12
+        year -= 1
+    first = date(year, month, 1)
+    end = min(date(year, month, monthrange(year, month)[1]), today)
+    return first, end
+
+
+def _keyboard_stats_after_report(detailed: bool = False, nav: Optional[tuple] = None) -> InlineKeyboardMarkup:
+    """
+    Клавиатура под отчётом. nav = (префикс, сдвиг) добавляет листание:
+    на текущем периоде только «предыдущий», дальше — обе стрелки.
+    """
     toggle = (
         InlineKeyboardButton("⬆️ Свернуть", callback_data=CB_STATS_BRIEF)
         if detailed
         else InlineKeyboardButton("🔍 Показать по статьям", callback_data=CB_STATS_DETAILS)
     )
-    rows = [[toggle], [InlineKeyboardButton("Добавить операцию в ДДС ✅", callback_data=CB_ADD_OPERATION)]]
+    rows = []
+    if nav:
+        prefix, offset = nav
+        word = "неделя" if prefix == CB_STATS_WEEK_PREFIX else "месяц"
+        nav_row = [InlineKeyboardButton(f"⬅️ Предыдущ{'ая' if word == 'неделя' else 'ий'} {word}",
+                                        callback_data=f"{prefix}{offset + 1}")]
+        if offset > 0:
+            nav_row.append(InlineKeyboardButton(f"Следующ{'ая' if word == 'неделя' else 'ий'} {word} ➡️",
+                                                callback_data=f"{prefix}{offset - 1}"))
+        rows.append(nav_row)
+    rows.append([toggle])
+    rows.append([InlineKeyboardButton("Добавить операцию в ДДС ✅", callback_data=CB_ADD_OPERATION)])
     sheet_url = _sheet_url()
     if sheet_url:
         rows.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
@@ -1533,7 +1569,7 @@ async def _deliver_stats_report(update, context, period_label: str, date_from: s
             pass
         return
     period_str = date_from if date_from == date_to else f"{date_from} – {date_to}"
-    context.user_data["_last_stats"] = (period_label, period_str, report)
+    context.user_data["_last_stats"] = (period_label, period_str, report, None)
     text_report = _format_stats_report(period_label, period_str, report)
     try:
         await update.message.reply_text(text_report, parse_mode="Markdown", reply_markup=_keyboard_stats_after_report())
@@ -1593,10 +1629,10 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             return
-        period_label, period_str, report = saved
+        period_label, period_str, report, nav = saved
         detailed = data == CB_STATS_DETAILS
         text = _format_stats_report(period_label, period_str, report, detailed=detailed)
-        kb = _keyboard_stats_after_report(detailed)
+        kb = _keyboard_stats_after_report(detailed, nav)
         try:
             await _retry_on_network(
                 lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
@@ -1685,16 +1721,25 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = None
     period_label = ""
     period_str = ""
+    nav = None
     if data == CB_STATS_TODAY:
         period_label = "Сегодня"
         period_str = today_str
         report = await asyncio.to_thread(svc.get_summary_for_date_range, today_str, today_str)
-    elif data == CB_STATS_WEEK:
-        period_label = "Неделя"
-        from_d = today - timedelta(days=6)
+    elif data == CB_STATS_WEEK or data.startswith(CB_STATS_WEEK_PREFIX):
+        offset = 0
+        if data.startswith(CB_STATS_WEEK_PREFIX):
+            try:
+                offset = max(0, int(data[len(CB_STATS_WEEK_PREFIX):]))
+            except ValueError:
+                offset = 0
+        from_d, to_d = _week_range(offset)
+        period_label = "Неделя" if offset == 0 else "Прошлая неделя" if offset == 1 else f"Неделя −{offset}"
         from_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year}"
-        period_str = f"{from_str} – {today_str}"
-        report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, today_str)
+        to_str = f"{to_d.day:02d}.{to_d.month:02d}.{to_d.year}"
+        period_str = f"{from_str} – {to_str}"
+        nav = (CB_STATS_WEEK_PREFIX, offset)
+        report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, to_str)
     elif data.startswith(CB_STATS_DAY_PREFIX):
         chosen = data[len(CB_STATS_DAY_PREFIX):]
         try:
@@ -1710,14 +1755,22 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         y_str = f"{y.day:02d}.{y.month:02d}.{y.year}"
         period_str = y_str
         report = await asyncio.to_thread(svc.get_summary_for_date_range, y_str, y_str)
-    elif data == CB_STATS_MONTH:
+    elif data == CB_STATS_MONTH or data.startswith(CB_STATS_MONTH_PREFIX):
         # Считаем по журналу операций, а не по листу «ДДС: Сводный»: там нет
         # разбивки по статьям, а доходы и расходы читаются неверно.
-        period_label = "Месяц"
-        from_d = date(today.year, today.month, 1)
+        offset = 0
+        if data.startswith(CB_STATS_MONTH_PREFIX):
+            try:
+                offset = max(0, int(data[len(CB_STATS_MONTH_PREFIX):]))
+            except ValueError:
+                offset = 0
+        from_d, to_d = _month_range(offset)
+        period_label = MONTHS_RU[from_d.month - 1]
         from_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year}"
-        period_str = f"{from_str} – {today_str}"
-        report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, today_str)
+        to_str = f"{to_d.day:02d}.{to_d.month:02d}.{to_d.year}"
+        period_str = f"{from_str} – {to_str}"
+        nav = (CB_STATS_MONTH_PREFIX, offset)
+        report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, to_str)
     if report is None:
         try:
             await _retry_on_network(
@@ -1726,9 +1779,9 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-    context.user_data["_last_stats"] = (period_label, period_str, report)
+    context.user_data["_last_stats"] = (period_label, period_str, report, nav)
     text = _format_stats_report(period_label, period_str, report)
-    kb = _keyboard_stats_after_report()
+    kb = _keyboard_stats_after_report(nav=nav)
     try:
         await _retry_on_network(lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb))
     except Exception:
