@@ -30,6 +30,12 @@ from telegram.ext import (
 )
 
 
+# Состояния диалога ловят кнопки с динамическими данными (индексы кошельков,
+# статей), поэтому позитивный фильтр им не подходит. Этот — отсекает чужие
+# кнопки, чтобы брошенный на середине диалог не глотал отчёты и настройки.
+CB_NOT_OTHER_SECTIONS = re.compile(r"^(?!stats_|payout_|payset_|master_|settings|sf_)")
+
+
 def _parse_allowed_user_ids() -> set:
     """Список разрешённых Telegram user ID из TELEGRAM_ALLOWED_IDS (через запятую). Пусто = доступ у всех."""
     raw = os.getenv("TELEGRAM_ALLOWED_IDS", "").strip()
@@ -4549,14 +4555,14 @@ def main() -> None:
                 CallbackQueryHandler(cancel_cmd, pattern=f"^{re.escape(CB_CANCEL)}$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, date_text),
             ],
-            TYPE_OP: [CallbackQueryHandler(type_selected)],
+            TYPE_OP: [CallbackQueryHandler(type_selected, pattern=CB_NOT_OTHER_SECTIONS)],
             ARTICLE: [
                 CallbackQueryHandler(
                     article_selected,
                     pattern=f"^({re.escape(CB_ARTICLE_BACK)}|{re.escape(CB_CANCEL)}|{re.escape(CB_ARTICLE_PAGE_NEXT)}|{re.escape(CB_ARTICLE_PAGE_PREV)}|{re.escape(CB_ARTICLE_PREFIX)}[0-9]+)$",
                 ),
             ],
-            WALLET: [CallbackQueryHandler(wallet_selected)],
+            WALLET: [CallbackQueryHandler(wallet_selected, pattern=CB_NOT_OTHER_SECTIONS)],
             AMOUNT: [
                 CallbackQueryHandler(cancel_callback, pattern=f"^{re.escape(CB_CANCEL)}$"),
                 CallbackQueryHandler(amount_back, pattern=f"^{re.escape(CB_BACK)}$"),
@@ -4595,8 +4601,8 @@ def main() -> None:
             CONFIRM_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_edit_input),
             ],
-            TRANSFER_FROM: [CallbackQueryHandler(transfer_from_selected)],
-            TRANSFER_TO: [CallbackQueryHandler(transfer_to_selected)],
+            TRANSFER_FROM: [CallbackQueryHandler(transfer_from_selected, pattern=CB_NOT_OTHER_SECTIONS)],
+            TRANSFER_TO: [CallbackQueryHandler(transfer_to_selected, pattern=CB_NOT_OTHER_SECTIONS)],
             TRANSFER_AMOUNT: [
                 CallbackQueryHandler(cancel_callback, pattern=f"^{re.escape(CB_CANCEL)}$"),
                 CallbackQueryHandler(transfer_amount_back, pattern=f"^{re.escape(CB_BACK)}$"),
