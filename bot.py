@@ -2314,22 +2314,21 @@ def _payment_due_date(payment: dict, today: date) -> Optional[date]:
 
 
 def _format_payment_reminder(payment: dict, due: date, days_left: int) -> str:
-    """Текст напоминания о платеже."""
-    name = str(payment.get("name", "Платёж"))
+    """Текст напоминания о платеже. Суммы не пишем — они каждый раз разные."""
+    name = str(payment.get("name", "платёж")).strip().lower()
     due_str = f"{due.day:02d}.{due.month:02d}.{due.year}"
+    weekday = _WEEKDAYS[due.weekday()].lower()
     if days_left == 0:
-        head = f"Сегодня {due_str} — {_escape_md(name.lower())}."
+        when = f"Сегодня, {due_str}"
     elif days_left == 1:
-        head = f"Завтра {due_str} — {_escape_md(name.lower())}."
+        when = f"Завтра, {due_str} ({weekday})"
     else:
-        head = f"Через {days_left} дн. ({due_str}) — {_escape_md(name.lower())}."
-    lines = ["🔔 *Напоминание*", "", head]
-    amount = payment.get("amount")
-    if amount:
-        lines.append(f"Сумма: *{_format_rub(float(amount))} ₽*")
-    lines.append("")
-    lines.append("Не забудь сделать платёж.")
-    return "\n".join(lines)
+        when = f"Через {days_left} дн., {due_str} ({weekday})"
+    return (
+        "🔔🔔🔔 *Напоминание!*\n\n"
+        f"{when} — {_escape_md(name)}.\n\n"
+        "Не забудьте сделать платеж 🙏"
+    )
 
 
 async def _payment_already_paid(context, payment: dict, today: date) -> bool:
