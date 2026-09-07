@@ -267,7 +267,9 @@ CB_STATS_BACK = "stats_back"
 CB_STATS_RANGE = "stats_range"
 CB_STATS_OPEN = "stats_open"  # открыть выбор периода отчёта (кнопка под балансом)
 CB_STATS_YESTERDAY = "stats_yesterday"
-CB_STATS_DAY = "stats_day"          # отчёт за один произвольный день
+CB_STATS_DAY = "stats_day"          # меню выбора конкретного дня
+CB_STATS_DAY_PREFIX = "stats_d_"    # + ДД.ММ.ГГГГ — отчёт за этот день
+CB_STATS_DAY_INPUT = "stats_dayinput"  # ввести дату вручную
 CB_STATS_DETAILS = "stats_details"  # раскрыть разбивку по статьям под отчётом
 CB_STATS_BRIEF = "stats_brief"      # свернуть разбивку обратно
 CB_SETTINGS_ADD_WALLET = "settings_add_wallet"
@@ -1121,12 +1123,12 @@ def _format_stats_report(period_label: str, period_str: str, report: dict, detai
     lines = [f"📊 *ОТЧЁТ · {_escape_md(period_label.upper())}*", f"`{_escape_md(period_str)}`", ""]
 
     if revenue is not None:
-        lines.append(f"💵 *Доходы*  +{_format_rub(revenue)} ₽")
+        lines.append(f"💵 *Доходы*  {'+' if revenue else ''}{_format_rub(revenue)} ₽")
         if detailed:
             lines += _breakdown_lines(report.get("income_by_article"))
             lines.append("")
     if expenses is not None:
-        lines.append(f"💸 *Расходы*  −{_format_rub(expenses)} ₽")
+        lines.append(f"💸 *Расходы*  {'−' if expenses else ''}{_format_rub(expenses)} ₽")
         if detailed:
             lines += _breakdown_lines(report.get("expense_by_article"))
             lines.append("")
@@ -1171,6 +1173,25 @@ def _keyboard_stats_period() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("Отмена ❌", callback_data=CB_STATS_CANCEL)],
     ])
+
+
+_WEEKDAYS = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье")
+
+
+def _keyboard_stats_days(count: int = 6) -> InlineKeyboardMarkup:
+    """Список последних дней с днём недели. Сегодня и вчера уже есть отдельными
+    кнопками, поэтому начинаем с позавчера."""
+    today = date.today()
+    buttons = []
+    for i in range(2, 2 + count):
+        d = today - timedelta(days=i)
+        label = f"{d.day:02d}.{d.month:02d} ({_WEEKDAYS[d.weekday()]})"
+        payload = f"{CB_STATS_DAY_PREFIX}{d.day:02d}.{d.month:02d}.{d.year}"
+        buttons.append(InlineKeyboardButton(label, callback_data=payload))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("✍️ Ввести свою дату", callback_data=CB_STATS_DAY_INPUT)])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data=CB_STATS_BACK)])
+    return InlineKeyboardMarkup(rows)
 
 
 def _keyboard_stats_waiting_range() -> InlineKeyboardMarkup:
@@ -1368,6 +1389,20 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
     if data == CB_STATS_DAY:
+        context.user_data.pop("_stats_waiting_day", None)
+        context.user_data.pop("_stats_waiting_range", None)
+        context.user_data.pop("_stats_date_from", None)
+        uid = update.effective_user.id if update.effective_user else None
+        if uid is not None:
+            _stats_waiting_user_ids.discard(uid)
+        try:
+            await _retry_on_network(
+                lambda: query.edit_message_text("Выберите день:", reply_markup=_keyboard_stats_days())
+            )
+        except Exception:
+            pass
+        return
+    if data == CB_STATS_DAY_INPUT:
         context.user_data["_stats_waiting_day"] = True
         context.user_data.pop("_stats_waiting_range", None)
         context.user_data.pop("_stats_date_from", None)
@@ -1427,6 +1462,15 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_str = f"{from_d.day:02d}.{from_d.month:02d}.{from_d.year}"
         period_str = f"{from_str} – {today_str}"
         report = await asyncio.to_thread(svc.get_summary_for_date_range, from_str, today_str)
+    elif data.startswith(CB_STATS_DAY_PREFIX):
+        chosen = data[len(CB_STATS_DAY_PREFIX):]
+        try:
+            d = date(int(chosen[6:10]), int(chosen[3:5]), int(chosen[:2]))
+            period_label = _WEEKDAYS[d.weekday()]
+        except (ValueError, IndexError):
+            period_label = "День"
+        period_str = chosen
+        report = await asyncio.to_thread(svc.get_summary_for_date_range, chosen, chosen)
     elif data == CB_STATS_YESTERDAY:
         period_label = "Вчера"
         y = today - timedelta(days=1)
