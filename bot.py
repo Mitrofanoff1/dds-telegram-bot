@@ -10,7 +10,8 @@ import re
 import sys
 import time
 import traceback
-from datetime import date, timedelta
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -2200,6 +2201,201 @@ async def payout_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     left = _payout_left_to_allocate(context)
     amount = round(min(amount, left), 2)  # больше, чем нужно вывести, не берём
     await _payout_allocate(context, None, wallet, amount, message=update.message)
+
+
+# Платёжный календарь: регулярные платежи и напоминания по ним.
+# day — число месяца или "last" (последний день). remind_days — за сколько дней
+# до платежа напоминать; 0 — в сам день.
+DEFAULT_PAYMENTS = [
+    {
+        "name": "Оплата аренды",
+        "day": 7,
+        "amount": 30000.0,
+        "article": "Аренда помещения и КУ",
+        "remind_days": [1, 0],
+    },
+    {
+        "name": "Зарплата админу",
+        "day": "last",
+        "amount": 20000.0,
+        "article": "Административные подрядчики",
+        "remind_days": [1, 0],
+    },
+]
+
+REMINDER_HOUR = 10  # во сколько слать напоминания
+
+
+def _payments_path() -> str:
+    return os.getenv("PAYMENTS_PATH", os.path.join(os.path.dirname(__file__) or ".", "payments.json"))
+
+
+def _reminders_state_path() -> str:
+    return os.getenv("REMINDERS_STATE_PATH", os.path.join(os.path.dirname(__file__) or ".", "reminders_state.json"))
+
+
+def _get_payments() -> list:
+    """Платёжный календарь из JSON, иначе значения по умолчанию."""
+    path = _payments_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+    return list(DEFAULT_PAYMENTS)
+
+
+def _load_reminders_state() -> dict:
+    path = _reminders_state_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_reminders_state(state: dict) -> None:
+    try:
+        with open(_reminders_state_path(), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _payment_due_date(payment: dict, today: date) -> Optional[date]:
+    """Дата платежа в месяце today. «last» — последний день месяца."""
+    day = payment.get("day")
+    last_day = monthrange(today.year, today.month)[1]
+    if isinstance(day, str) and day.strip().lower() == "last":
+        return date(today.year, today.month, last_day)
+    try:
+        day = int(day)
+    except (TypeError, ValueError):
+        return None
+    if day < 1:
+        return None
+    return date(today.year, today.month, min(day, last_day))
+
+
+def _format_payment_reminder(payment: dict, due: date, days_left: int) -> str:
+    """Текст напоминания о платеже."""
+    name = str(payment.get("name", "Платёж"))
+    due_str = f"{due.day:02d}.{due.month:02d}.{due.year}"
+    if days_left == 0:
+        head = f"Сегодня {due_str} — {_escape_md(name.lower())}."
+    elif days_left == 1:
+        head = f"Завтра {due_str} — {_escape_md(name.lower())}."
+    else:
+        head = f"Через {days_left} дн. ({due_str}) — {_escape_md(name.lower())}."
+    lines = ["🔔 *Напоминание*", "", head]
+    amount = payment.get("amount")
+    if amount:
+        lines.append(f"Сумма: *{_format_rub(float(amount))} ₽*")
+    lines.append("")
+    lines.append("Не забудь сделать платёж.")
+    return "\n".join(lines)
+
+
+async def _payment_already_paid(context, payment: dict, today: date) -> bool:
+    """Проведён ли этот платёж в текущем месяце (по статье)."""
+    article = (payment.get("article") or "").strip()
+    if not article:
+        return False
+    try:
+        svc = _get_sheet_service(context)
+        first = f"01.{today.month:02d}.{today.year}"
+        today_str = f"{today.day:02d}.{today.month:02d}.{today.year}"
+        summary = await asyncio.to_thread(svc.get_summary_for_date_range, first, today_str)
+    except Exception:
+        return False  # не смогли проверить — лучше напомнить лишний раз
+    by_article = (summary or {}).get("expense_by_article") or {}
+    return float(by_article.get(article, 0) or 0) > 0
+
+
+async def _send_due_reminders(application, today: date, force: bool = False) -> int:
+    """Рассылает напоминания о платежах на сегодня. Возвращает число отправленных."""
+    chat_ids = _parse_allowed_user_ids()
+    if not chat_ids:
+        return 0
+    context = ContextTypes.DEFAULT_TYPE(application=application)
+    state = _load_reminders_state()
+    today_key = today.isoformat()
+    sent = 0
+    for payment in _get_payments():
+        due = _payment_due_date(payment, today)
+        if due is None:
+            continue
+        days_left = (due - today).days
+        if days_left not in [int(d) for d in (payment.get("remind_days") or [0])]:
+            continue
+        key = f"{payment.get('name', '')}|{days_left}"
+        if not force and state.get(key) == today_key:
+            continue  # уже слали сегодня
+        if await _payment_already_paid(context, payment, today):
+            state[key] = today_key  # платёж сделан — напоминать не о чем
+            continue
+        text = _format_payment_reminder(payment, due, days_left)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)]])
+        for chat_id in chat_ids:
+            try:
+                await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
+                sent += 1
+            except Exception:
+                pass
+        state[key] = today_key
+    _save_reminders_state(state)
+    return sent
+
+
+async def _reminders_loop(application) -> None:
+    """Раз в минуту проверяет, не пора ли слать напоминания о платежах."""
+    while True:
+        try:
+            now = datetime.now()
+            if now.hour >= REMINDER_HOUR:
+                await _send_due_reminders(application, now.date())
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /payments — платёжный календарь на текущий месяц."""
+    today = date.today()
+    lines = [f"📅 *ПЛАТЁЖНЫЙ КАЛЕНДАРЬ* · {MONTHS_RU[today.month - 1]}", ""]
+    for payment in _get_payments():
+        due = _payment_due_date(payment, today)
+        if due is None:
+            continue
+        paid = await _payment_already_paid(context, payment, today)
+        days_left = (due - today).days
+        if paid:
+            mark, note = "✅", "оплачено"
+        elif days_left < 0:
+            mark, note = "🔴", f"просрочено на {-days_left} дн."
+        elif days_left == 0:
+            mark, note = "🔔", "сегодня"
+        else:
+            mark, note = "•", f"через {days_left} дн."
+        amount = payment.get("amount")
+        amount_str = f" — {_format_rub(float(amount))} ₽" if amount else ""
+        lines.append(
+            f"{mark} *{_escape_md(str(payment.get('name', '')))}*{amount_str}\n"
+            f"   {due.day:02d}.{due.month:02d}, {note}"
+        )
+    lines.append("")
+    lines.append(f"_Напоминания приходят в {REMINDER_HOUR}:00 по Москве._")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 def _keyboard_master_cancel() -> InlineKeyboardMarkup:
@@ -4425,6 +4621,7 @@ def main() -> None:
     app.add_handler(CommandHandler("funds", funds_cmd))
     app.add_handler(CommandHandler("dividends", dividends_cmd))
     app.add_handler(CommandHandler("master", master_cmd))
+    app.add_handler(CommandHandler("payments", payments_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("text", text_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
@@ -4471,9 +4668,15 @@ def main() -> None:
                 BotCommand("master", "Вывод мастеру"),
                 BotCommand("dividends", "Вывод дивидендов"),
                 BotCommand("funds", "Рассчитать фонды"),
+                BotCommand("payments", "Платёжный календарь"),
                 BotCommand("stats", "Отчёт ДДС"),
                 BotCommand("settings", "Настройки"),
             ])
+        except Exception:
+            pass
+        try:
+            application.create_task(_reminders_loop(application))
+            print(f"[Бот] Напоминания о платежах: в {REMINDER_HOUR}:00", file=sys.stderr)
         except Exception:
             pass
 
