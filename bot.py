@@ -870,6 +870,10 @@ async def handle_text_form_callback(update: Update, context: ContextTypes.DEFAUL
                 await context.bot.send_message(chat_id=query.message.chat_id, text=f"Ошибка: {e}")
             return
         if ud.get("type") == "transfer":
+            ok, balance = await _wallet_has_funds(context, ud.get("wallet_from"), ud.get("amount"))
+            if not ok:
+                await _send_not_enough(query, ud.get("wallet_from"), ud.get("amount"), balance)
+                return
             try:
                 await asyncio.to_thread(
                     svc.append_transfer,
@@ -896,6 +900,10 @@ async def handle_text_form_callback(update: Update, context: ContextTypes.DEFAUL
                     await query.edit_message_text("Ошибка: не выбрана статья. Введите операцию заново или /start.")
                 except Exception:
                     await context.bot.send_message(chat_id=query.message.chat_id, text="Ошибка: не выбрана статья. Введите операцию заново или /start.")
+                return
+            ok, balance = await _wallet_has_funds(context, ud.get("wallet"), amount if amount < 0 else 0)
+            if not ok:
+                await _send_not_enough(query, ud.get("wallet"), amount, balance)
                 return
             try:
                 await asyncio.to_thread(
@@ -1018,6 +1026,54 @@ async def handle_text_form_callback(update: Update, context: ContextTypes.DEFAUL
         text_confirm = _format_confirm_income_expense(context.user_data)
         await query.edit_message_text(text_confirm, reply_markup=_keyboard_confirm_text())
         return
+
+
+async def _wallet_has_funds(context: ContextTypes.DEFAULT_TYPE, wallet: str, amount) -> tuple:
+    """
+    Хватает ли на кошельке денег на списание. Возвращает (хватает, баланс).
+    Если баланс прочитать не удалось — не мешаем работать, пропускаем.
+    """
+    need = abs(float(amount or 0))
+    if need <= 0 or not wallet:
+        return True, 0.0
+    try:
+        svc = _get_sheet_service(context)
+        balances = await asyncio.to_thread(svc.get_balances, False)
+    except Exception:
+        return True, 0.0
+    balance = float(balances.get(wallet, 0) or 0)
+    return balance + 0.004 >= need, balance
+
+
+def _format_not_enough(wallet: str, need, balance) -> str:
+    """Сообщение «не хватает денег на кошельке»."""
+    need = abs(float(need))
+    balance = float(balance)
+    return (
+        f"🚫 *Недостаточно денег на «{_escape_md(wallet)}»*\n\n"
+        f"Нужно списать: {_format_amount(need)} ₽\n"
+        f"На кошельке: {_format_amount(balance)} ₽\n"
+        f"Не хватает: *{_format_amount(need - balance)} ₽*\n\n"
+        "Провести операцию в минус нельзя. Выберите другой кошелёк "
+        "или уменьшите сумму — и введите операцию заново."
+    )
+
+
+async def _send_not_enough(target, wallet: str, need, balance) -> None:
+    """Отправляет сообщение о нехватке денег — в окно кнопки или ответом на сообщение."""
+    text = _format_not_enough(wallet, need, balance)
+    edit = getattr(target, "edit_message_text", None)
+    if edit is not None:
+        try:
+            await _retry_on_network(lambda: edit(text, parse_mode="Markdown"))
+            return
+        except Exception:
+            pass
+    msg = getattr(target, "message", None) or target
+    try:
+        await msg.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 def _format_balance_after(wallet_names: list[str], balances: dict, total: Optional[float]) -> str:
@@ -1921,6 +1977,15 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
             pass
         return
     svc = _get_sheet_service(context)
+    # Между расчётом и подтверждением баланс мог измениться — проверяем заново
+    need_by_wallet = {}
+    for row in plan:
+        need_by_wallet[row["wallet"]] = round(need_by_wallet.get(row["wallet"], 0.0) + float(row["amount"]), 2)
+    for wallet, need in need_by_wallet.items():
+        ok, balance = await _wallet_has_funds(context, wallet, need)
+        if not ok:
+            await _send_not_enough(query, wallet, need, balance)
+            return
     try:
         direction = await asyncio.to_thread(svc.get_default_business_direction)
     except Exception:
@@ -2353,6 +2418,28 @@ async def _run_funds_logic(context: ContextTypes.DEFAULT_TYPE) -> str:
         direction = await asyncio.to_thread(svc.get_default_business_direction) or (svc.get_business_directions()[0] if svc.get_business_directions() else "")
     except Exception:
         direction = ""
+    # Сначала считаем, сколько уйдёт с каждого кошелька, и проверяем, что там есть деньги.
+    # Иначе отчисления могли увести счёт в минус.
+    needed_by_source = {}
+    for r in rules:
+        source = (r.get("source") or "").strip()
+        percent = float(r.get("percent", 0))
+        if not source or not (r.get("destination") or "").strip() or percent <= 0:
+            continue
+        raw = new_revenue * percent / 100
+        amount = int(raw + 0.5) if raw >= 0 else int(raw - 0.5)
+        if amount > 0:
+            needed_by_source[source] = needed_by_source.get(source, 0) + amount
+    for source, need in needed_by_source.items():
+        ok, balance = await _wallet_has_funds(context, source, need)
+        if not ok:
+            return (
+                f"🚫 Недостаточно денег на «{source}» для отчислений.\n\n"
+                f"Нужно перевести в фонды: {_format_amount(need)} ₽\n"
+                f"На кошельке: {_format_amount(balance)} ₽\n\n"
+                "Отчисления не сделаны — иначе счёт ушёл бы в минус."
+            )
+
     wallets_affected = set()
     transfers_made = []  # [(destination, to_transfer), ...] для сортировки по сумме
     this_run_total = 0.0  # сумма отчислений в этом запуске
@@ -3687,6 +3774,10 @@ async def _save_income_expense_callback(query, context: ContextTypes.DEFAULT_TYP
         amount = ud["amount"]
         if ud["type"] == "out":
             amount = -abs(amount)
+        ok, balance = await _wallet_has_funds(context, ud.get("wallet"), amount if amount < 0 else 0)
+        if not ok:
+            await _send_not_enough(query, ud.get("wallet"), amount, balance)
+            return ConversationHandler.END
         svc.append_operation(
             date_str=ud["date"],
             amount=amount,
@@ -3921,6 +4012,10 @@ async def _save_transfer_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         svc = _get_sheet_service(context)
         direction = svc.get_default_business_direction() or (svc.get_business_directions()[0] if svc.get_business_directions() else "")
+        ok, balance = await _wallet_has_funds(context, ud.get("wallet_from"), ud.get("amount"))
+        if not ok:
+            await _send_not_enough(query, ud.get("wallet_from"), ud.get("amount"), balance)
+            return ConversationHandler.END
         svc.append_transfer(
             date_str=ud["date"],
             amount=ud["amount"],
