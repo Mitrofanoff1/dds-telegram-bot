@@ -2292,7 +2292,8 @@ DEFAULT_PAYMENTS = [
     },
 ]
 
-REMINDER_HOUR = 10  # во сколько слать напоминания
+REMINDER_HOUR = 10     # во сколько слать напоминания о платежах
+DAILY_FILL_HOUR = 22   # во сколько проверять, заполнен ли ДДС за день
 
 
 def _payments_path() -> str:
@@ -2478,18 +2479,59 @@ async def _send_due_reminders(application, today: date, force: bool = False) -> 
     return sent
 
 
+async def _send_daily_fill_reminder(application, today: date, force: bool = False) -> bool:
+    """Вечерняя проверка: если за сегодня в ДДС нет ни одной строки — напомнить."""
+    chat_ids = _parse_allowed_user_ids()
+    if not chat_ids:
+        return False
+    state = _load_reminders_state()
+    key = "ддс_не_заполнен"
+    today_key = today.isoformat()
+    if not force and state.get(key) == today_key:
+        return False
+    context = ContextTypes.DEFAULT_TYPE(application=application)
+    today_str = f"{today.day:02d}.{today.month:02d}.{today.year}"
+    try:
+        svc = _get_sheet_service(context)
+        summary = await asyncio.to_thread(svc.get_summary_for_date_range, today_str, today_str)
+    except Exception:
+        return False  # не смогли прочитать — молчим, чтобы не пугать зря
+    if (summary or {}).get("rows_count"):
+        state[key] = today_key  # заполнен, напоминать не о чем
+        _save_reminders_state(state)
+        return False
+    text = (
+        "📌 *Уведомление*\n\n"
+        f"ДДС за сегодня ({today_str}) не заполнен.\n\n"
+        "Внесите операции за день, пока помните 🙏"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)]])
+    for chat_id in chat_ids:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+    state[key] = today_key
+    _save_reminders_state(state)
+    return True
+
+
 async def _reminders_loop(application) -> None:
     """
     Раз в минуту смотрит на часы. Разбор календаря делаем один раз в день,
     после REMINDER_HOUR, — незачем дёргать таблицу каждую минуту.
     """
-    checked_date = None
+    checked_payments = None
+    checked_fill = None
     while True:
         try:
             now = datetime.now()
-            if now.hour >= REMINDER_HOUR and checked_date != now.date():
+            if now.hour >= REMINDER_HOUR and checked_payments != now.date():
                 await _send_due_reminders(application, now.date())
-                checked_date = now.date()
+                checked_payments = now.date()
+            if now.hour >= DAILY_FILL_HOUR and checked_fill != now.date():
+                await _send_daily_fill_reminder(application, now.date())
+                checked_fill = now.date()
         except Exception:
             pass
         await asyncio.sleep(60)
@@ -4861,7 +4903,7 @@ def main() -> None:
             pass
         try:
             application.create_task(_reminders_loop(application))
-            print(f"[Бот] Напоминания о платежах: в {REMINDER_HOUR}:00", file=sys.stderr)
+            print(f"[Бот] Напоминания: платежи в {REMINDER_HOUR}:00, проверка заполнения ДДС в {DAILY_FILL_HOUR}:00", file=sys.stderr)
         except Exception:
             pass
 

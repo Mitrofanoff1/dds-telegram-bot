@@ -1146,6 +1146,7 @@ class DDSSheetService:
 
         total_income = 0.0
         total_expense = 0.0
+        rows_count = 0
         income_by_article: dict = {}
         expense_by_article: dict = {}
         funds_by_wallet: dict = {}
@@ -1158,6 +1159,7 @@ class DDSSheetService:
             amt = self._parse_number(cell(row, COL_AMOUNT).strip())
             if amt is None:
                 continue
+            rows_count += 1  # любая строка за период, включая переводы
             # Переводы между своими кошельками — не доход и не расход: они
             # только перекладывают деньги и в сумме дают ноль.
             if cell(row, COL_KIND).strip() == KIND_TECHNICAL:
@@ -1193,6 +1195,7 @@ class DDSSheetService:
             "change": change,
             "revenue": round(total_income, 2),
             "expenses": round(total_expense, 2),
+            "rows_count": rows_count,
             "income_by_article": income_by_article,
             "expense_by_article": expense_by_article,
             "funds_by_wallet": funds_by_wallet,
