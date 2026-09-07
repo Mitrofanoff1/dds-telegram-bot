@@ -2360,16 +2360,28 @@ def _format_payment_reminder(payment: dict, due: date, days_left: int) -> str:
     )
 
 
-async def _payment_already_paid(context, payment: dict, today: date) -> bool:
-    """Проведён ли этот платёж в текущем месяце (по статье)."""
+PAYMENT_PAID_TOLERANCE_DAYS = 5  # насколько раньше срока платёж считается этим же платежом
+
+
+async def _payment_already_paid(context, payment: dict, today: date, due: Optional[date]) -> bool:
+    """
+    Проведён ли именно ЭТОТ платёж. Ищем статью не «в календарном месяце», а в
+    окне вокруг даты платежа: иначе зарплата за август, выплаченная 1 сентября,
+    засчитывалась за сентябрьскую.
+    """
     article = (payment.get("article") or "").strip()
-    if not article:
+    if not article or due is None:
         return False
+    start = due - timedelta(days=PAYMENT_PAID_TOLERANCE_DAYS)
+    if start > today:
+        return False  # до срока ещё далеко, платить пока нечем
     try:
         svc = _get_sheet_service(context)
-        first = f"01.{today.month:02d}.{today.year}"
-        today_str = f"{today.day:02d}.{today.month:02d}.{today.year}"
-        summary = await asyncio.to_thread(svc.get_summary_for_date_range, first, today_str)
+        summary = await asyncio.to_thread(
+            svc.get_summary_for_date_range,
+            f"{start.day:02d}.{start.month:02d}.{start.year}",
+            f"{today.day:02d}.{today.month:02d}.{today.year}",
+        )
     except Exception:
         return False  # не смогли проверить — лучше напомнить лишний раз
     by_article = (summary or {}).get("expense_by_article") or {}
@@ -2395,7 +2407,7 @@ async def _send_due_reminders(application, today: date, force: bool = False) -> 
         key = f"{payment.get('name', '')}|{days_left}"
         if not force and state.get(key) == today_key:
             continue  # уже слали сегодня
-        if await _payment_already_paid(context, payment, today):
+        if await _payment_already_paid(context, payment, today, due):
             state[key] = today_key  # платёж сделан — напоминать не о чем
             continue
         text = _format_payment_reminder(payment, due, days_left)
@@ -2436,7 +2448,7 @@ async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         due = _payment_due_date(payment, today)
         if due is None:
             continue
-        paid = await _payment_already_paid(context, payment, today)
+        paid = await _payment_already_paid(context, payment, today, due)
         days_left = (due - today).days
         if paid:
             mark, note = "✅", "оплачено"
