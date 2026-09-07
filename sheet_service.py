@@ -159,6 +159,9 @@ def _load_credentials(credentials_path: str, scopes: list) -> Credentials:
     return Credentials.from_service_account_info(info, scopes=scopes)
 
 
+_STANDALONE_CREDS: dict = {}  # креды между вызовами, чтобы не запрашивать токен заново
+
+
 def get_balances_standalone(credentials_path: str, sheet_id: str) -> dict[str, float]:
     """
     Получает балансы только через REST API, без gspread.
@@ -169,8 +172,12 @@ def get_balances_standalone(credentials_path: str, sheet_id: str) -> dict[str, f
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-    creds = _load_credentials(credentials_path, scopes)
-    creds.refresh(AuthRequest())
+    creds = _STANDALONE_CREDS.get(credentials_path)
+    if creds is None:
+        creds = _load_credentials(credentials_path, scopes)
+        _STANDALONE_CREDS[credentials_path] = creds
+    if not getattr(creds, "valid", False):
+        creds.refresh(AuthRequest())
     token = creds.token
     if not token:
         raise RuntimeError("Не удалось получить токен доступа")
@@ -445,12 +452,18 @@ class DDSSheetService:
             balances["Итого"] = total
         return balances
 
+    def _refresh_creds_if_needed(self) -> None:
+        """Токен Google живёт час. Обновляем только когда он истёк — иначе на
+        каждое чтение уходил лишний round-trip к OAuth."""
+        if not getattr(self._creds, "valid", False):
+            self._creds.refresh(AuthRequest())
+
     def _fetch_balances_via_rest(self) -> dict[str, float]:
         """
         Читает балансы через REST API с санитизацией JSON.
         Обходит ошибку «Invalid control character», если в ячейках есть неэкранированные символы.
         """
-        self._creds.refresh(AuthRequest())
+        self._refresh_creds_if_needed()
         token = self._creds.token
         if not token:
             raise RuntimeError("Не удалось получить токен доступа")
@@ -605,7 +618,7 @@ class DDSSheetService:
 
     def _sheets_batch_update(self, requests: list) -> dict:
         """Вызов spreadsheets.batchUpdate через REST (нужен для скрытия/переименования листов и строк)."""
-        self._creds.refresh(AuthRequest())
+        self._refresh_creds_if_needed()
         token = self._creds.token
         if not token:
             raise RuntimeError("Не удалось получить токен доступа")
@@ -626,7 +639,7 @@ class DDSSheetService:
 
     def _get_spreadsheet_sheets(self) -> list[dict]:
         """Метаданные листов: sheetId, title, hidden (для поиска скрытого листа по номеру)."""
-        self._creds.refresh(AuthRequest())
+        self._refresh_creds_if_needed()
         token = self._creds.token
         if not token:
             raise RuntimeError("Не удалось получить токен доступа")
@@ -1052,38 +1065,36 @@ class DDSSheetService:
         if d1 is None or d2 is None or d1 > d2:
             return None
         ws = self._worksheet(SHEET_REGISTER)
-        col_c = ws.col_values(COL_DATE)
-        col_d = ws.col_values(COL_AMOUNT)
-        col_e = ws.col_values(COL_WALLET)
-        col_i = ws.col_values(COL_ARTICLE)
-        col_k = ws.col_values(COL_KIND)
+        # Один запрос на весь лист вместо пяти по колонкам: пять round-trip
+        # к Google растягивали отчёт до пяти секунд.
+        grid = _retry_sheets_fetch(lambda: ws.get_all_values())
 
-        def cell(col, idx):
-            return (col[idx] if idx < len(col) else "") or ""
+        def cell(row, col_num):
+            idx = col_num - 1
+            return (row[idx] if idx < len(row) else "") or ""
 
         total_income = 0.0
         total_expense = 0.0
         income_by_article: dict = {}
         expense_by_article: dict = {}
         funds_by_wallet: dict = {}
-        for i in range(1, min(len(col_c), len(col_d))):
-            d = (col_c[i] or "").strip()
-            dt = parse_dt(d)
+        for row in grid:
+            dt = parse_dt(cell(row, COL_DATE).strip())
             if dt is None:
                 continue
             if dt < d1 or dt > d2:
                 continue
-            amt = self._parse_number(str(col_d[i] or "").strip())
+            amt = self._parse_number(cell(row, COL_AMOUNT).strip())
             if amt is None:
                 continue
             # Переводы между своими кошельками — не доход и не расход: они
             # только перекладывают деньги и в сумме дают ноль.
-            if cell(col_k, i).strip() == KIND_TECHNICAL:
-                wallet = cell(col_e, i).strip()
+            if cell(row, COL_KIND).strip() == KIND_TECHNICAL:
+                wallet = cell(row, COL_WALLET).strip()
                 if amt > 0 and wallet.startswith("Фонд"):
                     funds_by_wallet[wallet] = round(funds_by_wallet.get(wallet, 0.0) + amt, 2)
                 continue
-            article = cell(col_i, i).strip() or "Без статьи"
+            article = cell(row, COL_ARTICLE).strip() or "Без статьи"
             if amt > 0:
                 total_income += amt
                 income_by_article[article] = round(income_by_article.get(article, 0.0) + amt, 2)
