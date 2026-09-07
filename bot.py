@@ -1218,12 +1218,12 @@ async def _build_full_balance_message():
             lines.append(f"• {w_esc}: <b>{_format_amount(amount)} ₽</b>")
     balance_buttons = [
         [InlineKeyboardButton("Добавить операцию ✅", callback_data=CB_ADD_OPERATION)],
-        [InlineKeyboardButton("Вывод Мастеру 💇", callback_data=CB_MASTER_OPEN)],
         [InlineKeyboardButton("Сформировать отчёт 📝", callback_data=CB_STATS_OPEN)],
     ]
     sheet_url = _sheet_url()
     if sheet_url:
         balance_buttons.append([InlineKeyboardButton("Перейти в таблицу 📊", url=sheet_url)])
+    balance_buttons.append([InlineKeyboardButton("Вывод мастеру 💇", callback_data=CB_MASTER_OPEN)])
     reply_markup = InlineKeyboardMarkup(balance_buttons)
     return "\n".join(lines), reply_markup
 
@@ -4468,7 +4468,7 @@ def main() -> None:
                 BotCommand("start", "Добавить операцию"),
                 BotCommand("balance", "Показать балансы"),
                 BotCommand("text", "Текстовый ввод операции"),
-                BotCommand("master", "Вывод Мастеру"),
+                BotCommand("master", "Вывод мастеру"),
                 BotCommand("dividends", "Вывод дивидендов"),
                 BotCommand("funds", "Рассчитать фонды"),
                 BotCommand("stats", "Отчёт ДДС"),
