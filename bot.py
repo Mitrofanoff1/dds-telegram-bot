@@ -1550,6 +1550,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def _alert(query, message: str) -> None:
+    """Всплывающее окно поверх чата: чтобы сбой не выглядел как «кнопка не работает»."""
+    try:
+        await query.answer(text=message[:190], show_alert=True)
+    except Exception:
+        pass
+
+
 async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка выбора периода в /stats и кнопки Назад под отчётом."""
     query = update.callback_query
@@ -1568,8 +1576,8 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=_keyboard_stats_period(),
                 )
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await _alert(query, f"Не удалось открыть отчёт: {e}")
         return
     if data in (CB_STATS_DETAILS, CB_STATS_BRIEF):
         saved = context.user_data.get("_last_stats")
@@ -1594,8 +1602,8 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             try:
                 await _retry_on_network(lambda: query.edit_message_text(text, reply_markup=kb))
-            except Exception:
-                pass
+            except Exception as e:
+                await _alert(query, f"Не удалось перерисовать отчёт: {e}")
         return
     if data == CB_STATS_BACK:
         context.user_data.pop("_stats_waiting_range", None)
@@ -1608,8 +1616,8 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _retry_on_network(
                 lambda: query.edit_message_text("Выберите период для отчёта:", reply_markup=_keyboard_stats_period())
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await _alert(query, f"Не удалось вернуться к выбору периода: {e}")
         return
     if data == CB_STATS_DAY:
         context.user_data.pop("_stats_waiting_day", None)
