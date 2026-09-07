@@ -2299,34 +2299,63 @@ def _save_reminders_state(state: dict) -> None:
 
 
 def _payment_due_date(payment: dict, today: date) -> Optional[date]:
-    """Дата платежа в месяце today. «last» — последний день месяца."""
+    """
+    Дата платежа: число месяца, «последний» (последний день месяца)
+    или конкретная дата ДД.ММ.ГГГГ для разового события.
+    """
     day = payment.get("day")
-    last_day = monthrange(today.year, today.month)[1]
-    if isinstance(day, str) and day.strip().lower() == "last":
-        return date(today.year, today.month, last_day)
+    if isinstance(day, str):
+        raw = day.strip().lower()
+        if raw.startswith("послед") or raw == "last":
+            return date(today.year, today.month, monthrange(today.year, today.month)[1])
+        if "." in raw:
+            parts = raw.split(".")
+            if len(parts) == 3:
+                try:
+                    return date(int(parts[2]), int(parts[1]), int(parts[0]))
+                except ValueError:
+                    return None
+            return None
     try:
         day = int(day)
     except (TypeError, ValueError):
         return None
     if day < 1:
         return None
+    last_day = monthrange(today.year, today.month)[1]
     return date(today.year, today.month, min(day, last_day))
 
 
 def _format_payment_reminder(payment: dict, due: date, days_left: int) -> str:
-    """Текст напоминания о платеже. Суммы не пишем — они каждый раз разные."""
-    name = str(payment.get("name", "платёж")).strip().lower()
+    """
+    Текст напоминания. Если в таблице заполнена колонка «Текст напоминания» —
+    берём его, подставив {когда}, {дата}, {день}, {платёж}. Иначе — обычный вид.
+    """
+    name = str(payment.get("name", "платёж")).strip()
     due_str = f"{due.day:02d}.{due.month:02d}.{due.year}"
     weekday = _WEEKDAYS[due.weekday()].lower()
     if days_left == 0:
-        when = f"Сегодня, {due_str}"
+        when = "Сегодня"
     elif days_left == 1:
-        when = f"Завтра, {due_str} ({weekday})"
+        when = "Завтра"
     else:
-        when = f"Через {days_left} дн., {due_str} ({weekday})"
+        when = f"Через {days_left} дн."
+
+    custom = str(payment.get("text") or "").strip()
+    if custom:
+        body = (
+            custom.replace("{когда}", when)
+            .replace("{дата}", due_str)
+            .replace("{день}", weekday)
+            .replace("{платёж}", name)
+            .replace("{платеж}", name)
+        )
+        return "🔔🔔🔔 *Напоминание!*\n\n" + _escape_md(body)
+
+    head = f"{when}, {due_str}" if days_left == 0 else f"{when}, {due_str} ({weekday})"
     return (
         "🔔🔔🔔 *Напоминание!*\n\n"
-        f"{when} — {_escape_md(name)}.\n\n"
+        f"{head} — {_escape_md(name.lower())}.\n\n"
         "Не забудьте сделать платеж 🙏"
     )
 

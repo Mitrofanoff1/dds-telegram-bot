@@ -1049,8 +1049,9 @@ class DDSSheetService:
     def get_payment_calendar(self) -> list:
         """
         Регулярные платежи из листа «Платёжный календарь».
-        Шапка в строке 2, данные с третьей: Платёж | День | Сумма | Статья |
-        Кошелёк | Напомнить за (дней) | Активен | Комментарий.
+        Шапка в строке 2, данные с третьей: Платёж | Дата/день | Сумма |
+        Статья | Кошелёк | Напомнить за (дней) | Активен | Текст напоминания |
+        Комментарий.
         Пустой список — листа нет или он не заполнен.
         """
         try:
@@ -1076,6 +1077,8 @@ class DDSSheetService:
             day_raw = cell(row, 1).lower()
             if day_raw.startswith("послед"):
                 day = "last"
+            elif "." in day_raw:
+                day = day_raw  # разовая дата ДД.ММ.ГГГГ — разбирается в боте
             else:
                 try:
                     day = int(float(day_raw.replace(",", ".")))
@@ -1093,9 +1096,7 @@ class DDSSheetService:
                 except ValueError:
                     pass
             if not remind:
-                remind = [1]
-            if 0 not in remind:
-                remind.append(0)  # в день платежа напоминаем всегда
+                remind = [0]  # ничего не указано — напоминаем в день платежа
             out.append({
                 "name": name,
                 "day": day,
@@ -1103,7 +1104,8 @@ class DDSSheetService:
                 "article": cell(row, 3),
                 "wallet": cell(row, 4),
                 "remind_days": sorted(set(remind), reverse=True),
-                "comment": cell(row, 7),
+                "text": cell(row, 7),
+                "comment": cell(row, 8),
             })
         return out
 
