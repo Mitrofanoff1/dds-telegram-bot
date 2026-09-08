@@ -33,7 +33,7 @@ from telegram.ext import (
 # Состояния диалога ловят кнопки с динамическими данными (индексы кошельков,
 # статей), поэтому позитивный фильтр им не подходит. Этот — отсекает чужие
 # кнопки, чтобы брошенный на середине диалог не глотал отчёты и настройки.
-CB_NOT_OTHER_SECTIONS = re.compile(r"^(?!stats_|payout_|payset_|paycal_|master_|settings|sf_)")
+CB_NOT_OTHER_SECTIONS = re.compile(r"^(?!stats_|payout_|payset_|paycal_|notify_|master_|settings|sf_)")
 
 
 def _parse_allowed_user_ids() -> set:
@@ -96,6 +96,7 @@ _stats_waiting_user_ids = set()  # ожидание ввода диапазон�
 _payout_waiting_user_ids = set()  # ожидание ручного ввода суммы при выводе дивидендов
 _payset_waiting_user_ids = set()  # ожидание ввода в настройках вывода дивидендов
 _master_waiting_user_ids = set()  # ожидание суммы выплаты мастеру
+_notify_waiting_user_ids = set()  # ожидание часа в настройках уведомлений
 
 # Защита от дублей: не слать меню /settings повторно, если уже отправили недавно (сетевой сбой → пользователь жмёт несколько раз)
 _settings_cmd_last_sent: dict[int, float] = {}
@@ -195,6 +196,8 @@ def _text_form_should_handle(update: Update) -> bool:
         return True
     if user_id is not None and user_id in _master_waiting_user_ids:
         return True
+    if user_id is not None and user_id in _notify_waiting_user_ids:
+        return True
     return _is_one_window_message(update.message.text)
 
 
@@ -282,6 +285,12 @@ CB_STATS_CANCEL = "stats_cancel"
 CB_STATS_BACK = "stats_back"
 CB_STATS_RANGE = "stats_range"
 CB_STATS_OPEN = "stats_open"  # открыть выбор периода отчёта (кнопка под балансом)
+CB_NOTIFY_OPEN = "notify_open"
+CB_NOTIFY_CLOSE = "notify_close"
+CB_NOTIFY_PAY_TOGGLE = "notify_pay"
+CB_NOTIFY_PAY_HOUR = "notify_payh"
+CB_NOTIFY_FILL_TOGGLE = "notify_fill"
+CB_NOTIFY_FILL_HOUR = "notify_fillh"
 CB_PAYCAL_OPEN = "paycal_open"
 CB_PAYCAL_BACK = "paycal_back"
 CB_PAYSET_OPEN = "payset_open"
@@ -727,6 +736,10 @@ async def handle_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ожидание суммы выплаты мастеру
     if user_id is not None and user_id in _master_waiting_user_ids:
         await master_amount_input(update, context)
+        return
+    # Ожидание часа в настройках уведомлений
+    if user_id is not None and user_id in _notify_waiting_user_ids:
+        await notify_settings_input(update, context)
         return
     # Ожидание ввода в настройках (отчисления в фонды или название нового кошелька)
     if user_id is not None and user_id in _settings_waiting_user_ids:
@@ -2526,10 +2539,14 @@ async def _reminders_loop(application) -> None:
     while True:
         try:
             now = datetime.now()
-            if now.hour >= REMINDER_HOUR and checked_payments != now.date():
+            context = ContextTypes.DEFAULT_TYPE(application=application)
+            rules = _get_notify_rules(context)
+            pay_hour = int(rules.get("payments_hour", REMINDER_HOUR))
+            fill_hour = int(rules.get("fill_hour", DAILY_FILL_HOUR))
+            if rules.get("payments_enabled") and now.hour >= pay_hour and checked_payments != now.date():
                 await _send_due_reminders(application, now.date())
                 checked_payments = now.date()
-            if now.hour >= DAILY_FILL_HOUR and checked_fill != now.date():
+            if rules.get("fill_enabled") and now.hour >= fill_hour and checked_fill != now.date():
                 await _send_daily_fill_reminder(application, now.date())
                 checked_fill = now.date()
         except Exception:
@@ -2597,7 +2614,8 @@ async def _build_payment_calendar_text(context) -> str:
             row += f" · {_escape_md(wallet)}"
         lines.append(row)
     lines.append("")
-    lines.append(f"_Напоминания приходят в {REMINDER_HOUR}:00 по Москве._")
+    hour = int(_get_notify_rules(context).get("payments_hour", REMINDER_HOUR))
+    lines.append(f"_Напоминания приходят в {hour:02d}:00 по Москве._")
     return "\n".join(lines)
 
 
@@ -2825,6 +2843,178 @@ async def master_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == CB_MASTER_CONFIRM:
         await _master_write(context, query)
         return
+
+
+# Настройки уведомлений: что присылать и во сколько.
+DEFAULT_NOTIFY_RULES = {
+    "payments_enabled": True,
+    "payments_hour": 10,
+    "fill_enabled": True,
+    "fill_hour": 22,
+}
+
+
+def _notify_rules_path() -> str:
+    return os.getenv("NOTIFY_RULES_PATH", os.path.join(os.path.dirname(__file__) or ".", "notify_rules.json"))
+
+
+def _get_notify_rules(context) -> dict:
+    """Настройки уведомлений: из bot_data, иначе из JSON, иначе по умолчанию."""
+    try:
+        cached = context.bot_data.get("notify_rules")
+    except Exception:
+        cached = None
+    if cached:
+        return dict(cached)
+    rules = dict(DEFAULT_NOTIFY_RULES)
+    path = _notify_rules_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                rules.update(data)
+        except Exception:
+            pass
+    try:
+        context.bot_data["notify_rules"] = dict(rules)
+    except Exception:
+        pass
+    return dict(rules)
+
+
+def _save_notify_rules(context, rules: dict) -> None:
+    try:
+        context.bot_data["notify_rules"] = dict(rules)
+    except Exception:
+        pass
+    try:
+        with open(_notify_rules_path(), "w", encoding="utf-8") as f:
+            json.dump(rules, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _format_notify_settings(rules: dict) -> str:
+    """Экран настроек уведомлений."""
+    on = lambda flag: "включено" if flag else "*выключено*"
+    return (
+        "🔔 *УВЕДОМЛЕНИЯ*\n\n"
+        f"*Напоминания о платежах* — {on(rules.get('payments_enabled'))}\n"
+        f"   в {int(rules.get('payments_hour', 10)):02d}:00, по платёжному календарю\n\n"
+        f"*Проверка заполнения ДДС* — {on(rules.get('fill_enabled'))}\n"
+        f"   в {int(rules.get('fill_hour', 22)):02d}:00, если за день нет ни одной операции\n\n"
+        "_Время московское._"
+    )
+
+
+def _keyboard_notify_settings(rules: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("🔕 Выключить напоминания о платежах" if rules.get("payments_enabled")
+             else "🔔 Включить напоминания о платежах"),
+            callback_data=CB_NOTIFY_PAY_TOGGLE)],
+        [InlineKeyboardButton("🕘 Время напоминаний о платежах", callback_data=CB_NOTIFY_PAY_HOUR)],
+        [InlineKeyboardButton(
+            ("🔕 Выключить проверку заполнения ДДС" if rules.get("fill_enabled")
+             else "🔔 Включить проверку заполнения ДДС"),
+            callback_data=CB_NOTIFY_FILL_TOGGLE)],
+        [InlineKeyboardButton("🕘 Время проверки ДДС", callback_data=CB_NOTIFY_FILL_HOUR)],
+        [InlineKeyboardButton("🔙 Назад", callback_data=CB_NOTIFY_CLOSE)],
+    ])
+
+
+async def notify_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки раздела «Уведомления» в настройках."""
+    query = update.callback_query
+    try:
+        await _retry_on_network(lambda: query.answer())
+    except Exception:
+        pass
+    data = query.data
+    uid = update.effective_user.id if update.effective_user else None
+    rules = _get_notify_rules(context)
+
+    async def show():
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                _format_notify_settings(_get_notify_rules(context)),
+                parse_mode="Markdown",
+                reply_markup=_keyboard_notify_settings(_get_notify_rules(context)),
+            ))
+        except Exception:
+            pass
+
+    if data == CB_NOTIFY_CLOSE:
+        if uid is not None:
+            _notify_waiting_user_ids.discard(uid)
+        context.user_data.pop("_notify_field", None)
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                "⚙️ **Настройки**\n\nВыберите раздел:", reply_markup=_keyboard_settings(), parse_mode="Markdown"
+            ))
+        except Exception:
+            pass
+        return
+    if data == CB_NOTIFY_OPEN:
+        if uid is not None:
+            _notify_waiting_user_ids.discard(uid)
+        context.user_data.pop("_notify_field", None)
+        await show()
+        return
+    if data in (CB_NOTIFY_PAY_TOGGLE, CB_NOTIFY_FILL_TOGGLE):
+        key = "payments_enabled" if data == CB_NOTIFY_PAY_TOGGLE else "fill_enabled"
+        rules[key] = not rules.get(key)
+        _save_notify_rules(context, rules)
+        await show()
+        return
+    if data in (CB_NOTIFY_PAY_HOUR, CB_NOTIFY_FILL_HOUR):
+        field = "payments_hour" if data == CB_NOTIFY_PAY_HOUR else "fill_hour"
+        context.user_data["_notify_field"] = field
+        if uid is not None:
+            _notify_waiting_user_ids.add(uid)
+        what = "напоминаний о платежах" if field == "payments_hour" else "проверки заполнения ДДС"
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                f"Во сколько присылать {what}? Введите час от 0 до 23:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=CB_NOTIFY_OPEN)]]),
+            ))
+        except Exception:
+            pass
+        return
+
+
+async def notify_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ввод часа для уведомлений."""
+    uid = update.effective_user.id if update.effective_user else None
+    field = context.user_data.pop("_notify_field", None)
+    if field is None:
+        if uid is not None:
+            _notify_waiting_user_ids.discard(uid)
+        return
+    text = (update.message.text or "").strip().split(":")[0]
+    try:
+        hour = int(text)
+    except ValueError:
+        hour = -1
+    if not 0 <= hour <= 23:
+        context.user_data["_notify_field"] = field
+        try:
+            await update.message.reply_text("Нужен час от 0 до 23. Например 22:")
+        except Exception:
+            pass
+        return
+    rules = _get_notify_rules(context)
+    rules[field] = hour
+    _save_notify_rules(context, rules)
+    if uid is not None:
+        _notify_waiting_user_ids.discard(uid)
+    try:
+        await update.message.reply_text(
+            _format_notify_settings(rules), parse_mode="Markdown", reply_markup=_keyboard_notify_settings(rules)
+        )
+    except Exception:
+        pass
 
 
 def _format_payout_settings(rules: dict) -> str:
@@ -3199,6 +3389,7 @@ def _keyboard_settings() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Настройка отчислений в фонды", callback_data=CB_SETTINGS_FUNDS)],
         [InlineKeyboardButton("Правила вывода дивидендов", callback_data=CB_PAYSET_OPEN)],
         [InlineKeyboardButton("Платёжный календарь", callback_data=CB_PAYCAL_OPEN)],
+        [InlineKeyboardButton("Уведомления", callback_data=CB_NOTIFY_OPEN)],
         [InlineKeyboardButton("Добавить новый кошелёк", callback_data=CB_SETTINGS_ADD_WALLET)],
         [InlineKeyboardButton("🔙 Назад", callback_data=CB_SETTINGS_BACK)],
     ])
@@ -4860,6 +5051,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(master_callback, pattern="^master_"))
     app.add_handler(CallbackQueryHandler(payout_settings_callback, pattern="^payset_"))
     app.add_handler(CallbackQueryHandler(payment_calendar_callback, pattern="^paycal_"))
+    app.add_handler(CallbackQueryHandler(notify_settings_callback, pattern="^notify_"))
     # Кнопка «Показать баланс» после внесения операции (показ в том же окне)
     app.add_handler(CallbackQueryHandler(show_balance_button_callback, pattern=f"^{re.escape(CB_SHOW_BALANCE)}$"))
     # Кнопка «🔙 Назад» в окне баланса (вернуться к «Операция внесена»)
