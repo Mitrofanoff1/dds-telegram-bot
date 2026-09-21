@@ -24,6 +24,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    TypeHandler,
     ContextTypes,
     filters,
     ConversationHandler,
@@ -93,7 +94,7 @@ _text_edit_waiting_user_ids = set()
 # Пользователи, ожидающие ввод в настройках отчислений в фонды (источник / фонд / %)
 _settings_waiting_user_ids = set()
 _stats_waiting_user_ids = set()  # ожидание ввода диапазона дат для /stats
-_payout_waiting_user_ids = set()  # ожидание ручного ввода суммы при выводе дивидендов
+_payout_waiting_user_ids = set()  # ожидание суммы при выводе дивидендов (к выводу, остаток или с кошелька)
 _payset_waiting_user_ids = set()  # ожидание ввода в настройках вывода дивидендов
 _master_waiting_user_ids = set()  # ожидание суммы выплаты мастеру
 _notify_waiting_user_ids = set()  # ожидание часа в настройках уведомлений
@@ -189,8 +190,6 @@ def _text_form_should_handle(update: Update) -> bool:
     if user_id is not None and user_id in _settings_waiting_user_ids:
         return True
     if user_id is not None and user_id in _stats_waiting_user_ids:
-        return True
-    if user_id is not None and user_id in _payout_waiting_user_ids:
         return True
     if user_id is not None and user_id in _payset_waiting_user_ids:
         return True
@@ -306,6 +305,8 @@ CB_MASTER_OPEN = "master_open"
 CB_MASTER_CONFIRM = "master_confirm"
 CB_MASTER_CANCEL = "master_cancel"
 CB_PAYOUT_OPEN = "payout_open"
+CB_PAYOUT_AMOUNT = "payout_amount"    # вывод конкретной суммы: ждём сумму
+CB_PAYOUT_RESERVE = "payout_reserve"  # вывод с остатком резерва: ждём, сколько оставить
 CB_PAYOUT_MANUAL = "payout_manual"
 CB_PAYOUT_MW_PREFIX = "payout_mw_"
 CB_PAYOUT_MALL = "payout_mall"
@@ -477,23 +478,29 @@ def _save_payout_rules(context: ContextTypes.DEFAULT_TYPE, rules: dict) -> None:
         pass
 
 
-def _compute_payout(balances: dict, rules: dict) -> dict:
-    """
-    Считает вывод: сколько всего доступно, сколько выводим после округления
-    и как это делится между участниками.
-    Возвращает словарь с available, payout, remainder, per_wallet, shares.
-    """
+def _payout_wallet_balances(balances: dict, rules: dict) -> dict:
+    """Остатки кошельков, с которых выводим дивиденды (фонды сюда не входят)."""
     sources = rules.get("source_wallets") or DEFAULT_PAYOUT_RULES["source_wallets"]
-    reserve = float(rules.get("reserve", 0) or 0)
+    return {w: float(balances.get(w, 0) or 0) for w in sources}
+
+
+def _payout_from_reserve(liquid: float, reserve: float, rules: dict) -> float:
+    """Сколько вывести, чтобы на кошельках осталось не меньше reserve. Округляем вниз до шага из настроек."""
+    payout = round(liquid - reserve, 2)
     round_to = float(rules.get("round_to", 0) or 0)
-    per_wallet = {w: float(balances.get(w, 0) or 0) for w in sources}
-    liquid = round(sum(per_wallet.values()), 2)
-    available = round(liquid - reserve, 2)
-    payout = available
     if round_to > 0 and payout > 0:
         payout = float(int(payout / round_to) * round_to)
-    if payout < 0:
-        payout = 0.0
+    return max(payout, 0.0)
+
+
+def _compute_payout(balances: dict, rules: dict, payout: float) -> dict:
+    """
+    Делит сумму вывода между участниками по долям.
+    Возвращает словарь с liquid, reserve (неснижаемый остаток из настроек), payout, remainder, per_wallet, shares.
+    """
+    per_wallet = _payout_wallet_balances(balances, rules)
+    liquid = round(sum(per_wallet.values()), 2)
+    payout = round(float(payout), 2)
     participants = rules.get("participants") or []
     total_share = sum(float(p.get("share", 0) or 0) for p in participants)
     shares = []
@@ -508,8 +515,7 @@ def _compute_payout(balances: dict, rules: dict) -> dict:
             shares.append({"name": str(p.get("name", "")), "share": float(p.get("share", 0) or 0), "amount": amount})
     return {
         "liquid": liquid,
-        "reserve": reserve,
-        "available": available,
+        "reserve": float(rules.get("reserve", 0) or 0),
         "payout": payout,
         "remainder": round(liquid - payout, 2),
         "per_wallet": per_wallet,
@@ -724,10 +730,6 @@ async def handle_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ожидание ввода диапазона дат для /stats
     if user_id is not None and user_id in _stats_waiting_user_ids:
         await stats_range_input_handler(update, context)
-        return
-    # Ожидание ручного ввода суммы при выводе дивидендов
-    if user_id is not None and user_id in _payout_waiting_user_ids:
-        await payout_manual_input(update, context)
         return
     # Ожидание ввода в настройках вывода дивидендов
     if user_id is not None and user_id in _payset_waiting_user_ids:
@@ -1339,6 +1341,13 @@ def _format_rub(value: float) -> str:
     return f"{round(value):,}".replace(",", "\u00a0")
 
 
+def _format_rub_exact(value: float) -> str:
+    """Сумма без копеек, если она целая, иначе с копейками: 50 000 или 50 000,50."""
+    if abs(value - round(value)) < 0.005:
+        return _format_rub(value)
+    return _format_amount(value)
+
+
 def _breakdown_lines(data: dict, limit: int = 10) -> list:
     """Строки разбивки «• статья — сумма», крупные сверху, хвост сворачивается."""
     items = sorted((data or {}).items(), key=lambda kv: -kv[1])
@@ -1853,32 +1862,64 @@ def _payout_auto_split(calc: dict, rules: dict) -> dict:
     return result
 
 
-def _format_payout_screen(calc: dict, rules: dict, rent_note: str = "") -> str:
-    """Экран расчёта дивидендов: сумма, доли, списание, баланс кошельков, резерв."""
+def _payout_clear(context: ContextTypes.DEFAULT_TYPE, uid) -> None:
+    """Сбрасывает расчёт вывода и ожидание ввода суммы."""
+    for key in ("_payout_mode", "_payout_liquid", "_payout_calc", "_payout_alloc", "_payout_pick", "_payout_plan"):
+        context.user_data.pop(key, None)
+    if uid is not None:
+        _payout_waiting_user_ids.discard(uid)
+
+
+def _format_payout_balance(per_wallet: dict, liquid: float) -> str:
+    """Шапка «Вывод дивидендов»: остатки кошельков и их общая сумма, без фондов."""
     lines = [f"💸 *ВЫВОД ДИВИДЕНДОВ* · {_today_str()}", ""]
-    lines.append(f"💰 *К выводу — {_format_rub(calc['payout'])} ₽*")
-    for sh in calc["shares"]:
-        lines.append(f"   {_escape_md(sh['name'])} — {_format_rub(sh['amount'])} ₽")
-    split = calc.get("split") or {}
-    if split:
-        lines.append("")
-        lines.append("*Списание:*")
-        for wallet, amount in split.items():
-            lines.append(f"   {_format_rub(amount)} — {_escape_md(wallet)}")
-    lines.append("")
-    lines.append(f"💸 *Баланс кошельков: {_format_amount(calc['liquid'])} ₽*")
-    for wallet, amount in calc["per_wallet"].items():
+    lines.append(f"💰 *Баланс кошельков: {_format_amount(liquid)} ₽*")
+    for wallet, amount in per_wallet.items():
         lines.append(f"• {_escape_md(wallet)}: {_format_amount(amount)} ₽")
-    lines.append("")
-    lines.append(f"Резерв: {_format_rub(calc['reserve'])} ₽")
-    if rent_note:
-        lines.append("")
-        lines.append(rent_note)
     return "\n".join(lines)
 
 
+def _keyboard_payout_start() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Вывод конкретной суммы 💰", callback_data=CB_PAYOUT_AMOUNT)],
+        [InlineKeyboardButton("Вывод с остатком резерва 🏦", callback_data=CB_PAYOUT_RESERVE)],
+        [InlineKeyboardButton("Отмена ❌", callback_data=CB_PAYOUT_CANCEL)],
+    ])
+
+
+def _format_payout_prompt(mode: str, liquid: float, rules: dict) -> str:
+    """Запрос суммы: сколько вывести (amount) или сколько оставить на кошельках (reserve)."""
+    if mode == "amount":
+        return (
+            "💰 *ВЫВОД КОНКРЕТНОЙ СУММЫ*\n\n"
+            f"На кошельках: *{_format_amount(liquid)} ₽*\n\n"
+            "Сколько выводим? Введите сумму — она разделится между участниками:"
+        )
+    lines = ["🏦 *ВЫВОД С ОСТАТКОМ РЕЗЕРВА*", "", f"На кошельках: *{_format_amount(liquid)} ₽*"]
+    reserve = float(rules.get("reserve", 0) or 0)
+    if reserve > 0:
+        lines.append(f"_Неснижаемый остаток по правилам — {_format_rub(reserve)} ₽_")
+    lines.append("")
+    lines.append("Сколько оставляем на кошельках? Введите сумму — бот посчитает, сколько вывести:")
+    return "\n".join(lines)
+
+
+def _keyboard_payout_input() -> InlineKeyboardMarkup:
+    """Шаг ввода суммы: назад к выбору способа вывода или отмена."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Назад", callback_data=CB_PAYOUT_OPEN), InlineKeyboardButton("Отмена ❌", callback_data=CB_PAYOUT_CANCEL)],
+    ])
+
+
+def _payout_set_split(context: ContextTypes.DEFAULT_TYPE, calc: dict, split: dict) -> None:
+    """Запоминает расчёт и раскладку по кошелькам — это и уйдёт в ДДС по подтверждению."""
+    context.user_data["_payout_calc"] = calc
+    context.user_data["_payout_alloc"] = dict(split)
+    context.user_data["_payout_plan"] = _split_payout_across_wallets(split, calc["shares"])
+
+
 async def _payout_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_query=None):
-    """Первый экран «Вывод дивидендов»: расчёт и выбор кошельков."""
+    """Первый экран «Вывод дивидендов»: баланс кошельков и выбор способа вывода."""
     async def reply(text, kb):
         if edit_query is not None:
             try:
@@ -1891,6 +1932,7 @@ async def _payout_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
             except Exception:
                 pass
 
+    _payout_clear(context, update.effective_user.id if update.effective_user else None)
     rules = _get_payout_rules(context)
     try:
         svc = _get_sheet_service(context)
@@ -1915,22 +1957,14 @@ async def _payout_start(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
             )
             return
 
-    calc = _compute_payout(balances, rules)
-    if calc["payout"] <= 0:
-        await reply(
-            _format_payout_screen(calc, rules)
-            + "\n\n🚫 Выводить нечего: на кошельках меньше, чем неснижаемый остаток.",
-            _keyboard_payout_cancel(),
-        )
+    per_wallet = _payout_wallet_balances(balances, rules)
+    liquid = round(sum(per_wallet.values()), 2)
+    text = _format_payout_balance(per_wallet, liquid)
+    if liquid <= 0:
+        await reply(text + "\n\n🚫 Выводить нечего: на кошельках нет денег.", _keyboard_payout_cancel())
         return
-
-    split = _payout_auto_split(calc, rules)
-    calc["split"] = split
-    context.user_data["_payout_calc"] = calc
-    context.user_data["_payout_alloc"] = dict(split)
-    context.user_data["_payout_wallets"] = dict(split)
-    context.user_data["_payout_plan"] = _split_payout_across_wallets(split, calc["shares"])
-    await reply(_format_payout_screen(calc, rules), _keyboard_payout_confirm())
+    context.user_data["_payout_liquid"] = liquid
+    await reply(text + "\n\nКак выводим?", _keyboard_payout_start())
 
 
 def _payout_left_to_allocate(context: ContextTypes.DEFAULT_TYPE) -> float:
@@ -2021,45 +2055,50 @@ async def _payout_allocate(context: ContextTypes.DEFAULT_TYPE, query, wallet: st
     if uid is not None:
         _payout_waiting_user_ids.discard(uid)
     calc = context.user_data.get("_payout_calc")
-    plan = _split_payout_across_wallets(alloc, calc["shares"])
-    context.user_data["_payout_wallets"] = alloc
-    context.user_data["_payout_plan"] = plan
-    text = _format_payout_confirm(calc, alloc, plan)
+    _payout_set_split(context, calc, alloc)
+    text = _format_payout_confirm(calc, alloc)
+    kb = _keyboard_payout_confirm(calc.get("mode"))
     if query is not None:
         try:
-            await _retry_on_network(lambda: query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=_keyboard_payout_confirm()
-            ))
+            await _retry_on_network(lambda: query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb))
         except Exception:
             pass
     else:
         try:
-            await message.reply_text(text, parse_mode="Markdown", reply_markup=_keyboard_payout_confirm())
+            await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
         except Exception:
             pass
 
 
-def _format_payout_confirm(calc: dict, wallet_amounts: dict, plan: list) -> str:
-    """Экран подтверждения: что именно уйдёт в таблицу."""
+def _format_payout_confirm(calc: dict, wallet_amounts: dict) -> str:
+    """Экран подтверждения: сколько выводим, как делится между участниками и с каких кошельков."""
     lines = ["✅ *ПРОВЕРЬТЕ ПЕРЕД ЗАПИСЬЮ*", ""]
-    lines.append("*Списываем:*")
-    for w, a in wallet_amounts.items():
-        lines.append(f"   {_escape_md(w)} — {_format_rub(a)} ₽")
+    lines.append(f"💰 *К выводу — {_format_rub_exact(calc['payout'])} ₽*")
+    for sh in calc["shares"]:
+        lines.append(f"   {_escape_md(sh['name'])} — {_format_rub_exact(sh['amount'])} ₽")
     lines.append("")
-    lines.append(f"*В ДДС уйдёт {len(plan)} " + ("операция" if len(plan) == 1 else "операции") + ":*")
-    for row in plan:
-        lines.append(f"   {_escape_md(row['name'])} — {_format_rub(row['amount'])} ₽ ({_escape_md(row['wallet'])})")
+    lines.append("*Списание:*")
+    for wallet, amount in wallet_amounts.items():
+        if amount > 0.004:
+            lines.append(f"   {_format_rub_exact(amount)} — {_escape_md(wallet)}")
     lines.append("")
-    lines.append(f"После вывода останется {_format_rub(calc['remainder'])} ₽")
+    lines.append(f"Останется на кошельках: {_format_rub_exact(calc['remainder'])} ₽")
+    if calc["remainder"] < calc.get("reserve", 0) - 0.004:
+        lines.append(f"⚠️ Меньше неснижаемого остатка ({_format_rub(calc['reserve'])} ₽)")
+    if calc.get("rounded_to"):
+        lines.append(f"_Сумма к выводу округлена вниз, кратно {_format_rub(calc['rounded_to'])} ₽_")
     return "\n".join(lines)
 
 
-def _keyboard_payout_confirm() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Подтвердить списание ✅", callback_data=CB_PAYOUT_CONFIRM)],
-        [InlineKeyboardButton("Изменить вывод с кошельков 💰", callback_data=CB_PAYOUT_MANUAL)],
-        [InlineKeyboardButton("Отмена ❌", callback_data=CB_PAYOUT_CANCEL)],
-    ])
+def _keyboard_payout_confirm(mode: Optional[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("Подтвердить списание ✅", callback_data=CB_PAYOUT_CONFIRM)]]
+    if mode == "reserve":
+        rows.append([InlineKeyboardButton("Изменить остаток ✏️", callback_data=CB_PAYOUT_RESERVE)])
+    else:
+        rows.append([InlineKeyboardButton("Изменить сумму ✏️", callback_data=CB_PAYOUT_AMOUNT)])
+    rows.append([InlineKeyboardButton("Изменить вывод с кошельков 💰", callback_data=CB_PAYOUT_MANUAL)])
+    rows.append([InlineKeyboardButton("Отмена ❌", callback_data=CB_PAYOUT_CANCEL)])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
@@ -2104,7 +2143,7 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
             )
             written.append(row)
     except Exception as e:
-        done = "\n".join(f"   {r['name']} — {_format_rub(r['amount'])} ₽ ({r['wallet']})" for r in written)
+        done = "\n".join(f"   {r['name']} — {_format_rub_exact(r['amount'])} ₽ ({r['wallet']})" for r in written)
         msg = "⚠️ *Записано не всё.*\n\nУспели попасть в таблицу:\n" + (done or "   ничего")
         msg += "\n\nОшибка: " + _escape_md(str(e).split("\n")[0][:200])
         msg += "\n\nПроверьте таблицу перед повторной попыткой."
@@ -2121,8 +2160,7 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
         total_after = balances_after.pop("Итого", None)
     except Exception:
         balances_after = None
-    for key in ("_payout_calc", "_payout_alloc", "_payout_pick", "_payout_wallets", "_payout_plan"):
-        context.user_data.pop(key, None)
+    _payout_clear(context, query.from_user.id if query.from_user else None)
     # Группируем строки плана по участникам: кто сколько и с какого кошелька получил
     by_person = {}
     for row in plan:
@@ -2131,9 +2169,9 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
     for sh in calc["shares"]:
         lines.append(f"*{_escape_md(sh['name'])} к получению:*")
         for wallet, amount in by_person.get(sh["name"], []):
-            lines.append(f"   {_format_rub(amount)} ₽ — {_escape_md(wallet)}")
+            lines.append(f"   {_format_rub_exact(amount)} ₽ — {_escape_md(wallet)}")
         lines.append("")
-    lines.append(f"Всего выведено {_format_rub(calc['payout'])} ₽")
+    lines.append(f"Всего выведено {_format_rub_exact(calc['payout'])} ₽")
     if balances_after:
         lines.append("")
         lines.append("📊 *Баланс кошельков после операции:*")
@@ -2144,7 +2182,7 @@ async def _payout_write(context: ContextTypes.DEFAULT_TYPE, query):
             lines.append("")
             lines.append(f"ОБЩИЙ БАЛАНС: *{_format_amount(total_after)} ₽*")
     else:
-        lines.append(f"На кошельках осталось {_format_rub(calc['remainder'])} ₽")
+        lines.append(f"На кошельках осталось {_format_rub_exact(calc['remainder'])} ₽")
     kb_rows = [[InlineKeyboardButton("Показать баланс", callback_data=CB_SHOW_BALANCE)]]
     sheet_url = _sheet_url()
     if sheet_url:
@@ -2174,19 +2212,55 @@ async def payout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     uid = update.effective_user.id if update.effective_user else None
     if data == CB_PAYOUT_CANCEL:
-        for key in ("_payout_calc", "_payout_alloc", "_payout_pick", "_payout_wallets", "_payout_plan"):
-            context.user_data.pop(key, None)
-        if uid is not None:
-            _payout_waiting_user_ids.discard(uid)
+        _payout_clear(context, uid)
         try:
             await _retry_on_network(lambda: query.edit_message_text("Вывод отменён."))
         except Exception:
             pass
         return
-    if data in (CB_PAYOUT_OPEN, CB_PAYOUT_BACK):
+    if data == CB_PAYOUT_OPEN:
+        await _payout_start(update, context, edit_query=query)
+        return
+    if data in (CB_PAYOUT_AMOUNT, CB_PAYOUT_RESERVE):
+        liquid = context.user_data.get("_payout_liquid")
+        if liquid is None:
+            # бот перезапускался и забыл баланс — показываем первый экран заново
+            await _payout_start(update, context, edit_query=query)
+            return
+        mode = "amount" if data == CB_PAYOUT_AMOUNT else "reserve"
+        for key in ("_payout_calc", "_payout_alloc", "_payout_pick", "_payout_plan"):
+            context.user_data.pop(key, None)
+        context.user_data["_payout_mode"] = mode
+        if uid is not None:
+            _payout_waiting_user_ids.add(uid)
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                _format_payout_prompt(mode, liquid, _get_payout_rules(context)),
+                parse_mode="Markdown",
+                reply_markup=_keyboard_payout_input(),
+            ))
+        except Exception:
+            pass
+        return
+    if data == CB_PAYOUT_BACK:
+        # из ручного выбора кошельков — обратно к подтверждению с раскладкой по умолчанию
+        calc = context.user_data.get("_payout_calc")
+        if not calc:
+            await _payout_start(update, context, edit_query=query)
+            return
         if uid is not None:
             _payout_waiting_user_ids.discard(uid)
-        await _payout_start(update, context, edit_query=query)
+        context.user_data.pop("_payout_pick", None)
+        split = _payout_auto_split(calc, _get_payout_rules(context))
+        _payout_set_split(context, calc, split)
+        try:
+            await _retry_on_network(lambda: query.edit_message_text(
+                _format_payout_confirm(calc, split),
+                parse_mode="Markdown",
+                reply_markup=_keyboard_payout_confirm(calc.get("mode")),
+            ))
+        except Exception:
+            pass
         return
     if data == CB_PAYOUT_MANUAL:
         calc = context.user_data.get("_payout_calc")
@@ -2198,7 +2272,6 @@ async def payout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["_payout_alloc"] = {}
         context.user_data.pop("_payout_pick", None)
-        context.user_data.pop("_payout_wallets", None)
         context.user_data.pop("_payout_plan", None)
         if uid is not None:
             _payout_waiting_user_ids.discard(uid)
@@ -2251,6 +2324,105 @@ async def payout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _payout_write(context, query)
         return
 
+
+async def _drop_payout_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перестаёт ждать сумму дивидендов, если пришла команда или кнопка не из вывода. Дальше апдейт идёт как обычно."""
+    user = update.effective_user
+    if user is None or user.id not in _payout_waiting_user_ids:
+        return
+    if update.callback_query is not None:
+        if (update.callback_query.data or "").startswith("payout_"):
+            return
+    elif not (update.message and (update.message.text or "").startswith("/")):
+        return
+    _payout_waiting_user_ids.discard(user.id)
+
+
+# Сумма при выводе — только число, можно с пробелами и «₽»/«р»/«руб».
+# Иначе «100к» прочиталось бы как 100 ₽, а текст операции — как её сумма.
+_PAYOUT_AMOUNT_RE = re.compile(r"^[\d\s.,]+(₽|р\.?|руб\.?)?$", re.IGNORECASE)
+
+
+def _parse_payout_amount(text: str) -> Optional[float]:
+    s = (text or "").strip()
+    if not _PAYOUT_AMOUNT_RE.match(s):
+        return None
+    return DDSSheetService.parse_amount(s)
+
+
+async def payout_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текст в процессе вывода: сумма с выбранного кошелька или сумма/остаток на шаге ввода."""
+    if context.user_data.get("_payout_pick"):
+        await payout_manual_input(update, context)
+        return
+    await payout_target_input(update, context)
+
+
+async def payout_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сумма к выводу или остаток на кошельках → расчёт, раскладка по кошелькам и подтверждение."""
+    uid = update.effective_user.id if update.effective_user else None
+
+    async def say(text, **kwargs):
+        try:
+            await update.message.reply_text(text, **kwargs)
+        except Exception:
+            pass
+
+    mode = context.user_data.get("_payout_mode")
+    if mode not in ("amount", "reserve"):
+        _payout_clear(context, uid)
+        await say("Расчёт устарел — начните заново: /dividends")
+        return
+    value = _parse_payout_amount(update.message.text)
+    if value is None or value < 0 or (mode == "amount" and value <= 0):
+        await say(f"Не понял сумму. Введите число, например {'100000' if mode == 'amount' else '30000'}:")
+        return
+    value = round(float(value), 2)
+    rules = _get_payout_rules(context)
+    try:
+        svc = _get_sheet_service(context)
+        balances = await asyncio.to_thread(svc.get_balances, False)
+    except Exception as e:
+        await say(_format_sheet_error(e))
+        return
+    per_wallet = _payout_wallet_balances(balances, rules)
+    liquid = round(sum(per_wallet.values()), 2)
+    context.user_data["_payout_liquid"] = liquid
+    if mode == "amount":
+        if value > liquid + 0.004:
+            await say(f"На кошельках {_format_amount(liquid)} ₽ — больше не вывести. Введите сумму поменьше:")
+            return
+        payout = value
+    else:
+        if value >= liquid - 0.004:
+            await say(
+                f"На кошельках {_format_amount(liquid)} ₽ — если оставить {_format_rub_exact(value)} ₽, "
+                "выводить нечего. Введите остаток поменьше:"
+            )
+            return
+        payout = _payout_from_reserve(liquid, value, rules)
+        if payout <= 0:
+            await say(
+                f"Если оставить {_format_rub_exact(value)} ₽, к выводу приходится "
+                f"{_format_rub_exact(liquid - value)} ₽ — меньше шага округления "
+                f"{_format_rub(float(rules.get('round_to', 0) or 0))} ₽. Введите остаток поменьше:"
+            )
+            return
+    calc = _compute_payout(balances, rules, payout)
+    if not calc["shares"]:
+        _payout_clear(context, uid)
+        await say("В правилах вывода не заданы доли участников. Проверьте /settings → «Правила вывода дивидендов».")
+        return
+    calc["mode"] = mode
+    if mode == "reserve" and calc["remainder"] > value + 0.004:
+        calc["rounded_to"] = float(rules.get("round_to", 0) or 0)
+    if uid is not None:
+        _payout_waiting_user_ids.discard(uid)
+    split = _payout_auto_split(calc, rules)
+    _payout_set_split(context, calc, split)
+    await say(_format_payout_confirm(calc, split), parse_mode="Markdown", reply_markup=_keyboard_payout_confirm(mode))
+
+
 async def payout_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ввод суммы для выбранного кошелька при ручном распределении."""
     uid = update.effective_user.id if update.effective_user else None
@@ -2264,7 +2436,7 @@ async def payout_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
         return
-    amount = DDSSheetService.parse_amount((update.message.text or "").replace(",", "."))
+    amount = _parse_payout_amount(update.message.text)
     if amount is None or amount <= 0:
         try:
             await update.message.reply_text(f"Не понял сумму. Сколько списать с «{wallet}»? Введите число.")
@@ -5034,6 +5206,9 @@ def main() -> None:
             _BlockedUserHandler(allowed_ids, _deny_access_handler),
             group=-1,
         )
+    # Та же группа, после проверки доступа: команда или кнопка другого раздела отменяет
+    # ожидание суммы дивидендов — иначе сумма для мастера или из настроек ушла бы в вывод.
+    app.add_handler(TypeHandler(Update, _drop_payout_wait), group=-1)
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("funds", funds_cmd))
@@ -5060,6 +5235,16 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(funds_button_callback, pattern=f"^{re.escape(CB_RUN_FUNDS)}$"))
     # Кнопки после текстового ввода (выбор статьи, подтверждение)
     app.add_handler(CallbackQueryHandler(handle_text_form_callback, pattern="^text_"))
+    # Сумма при выводе дивидендов — раньше пошагового ввода: брошенный на середине диалог
+    # операции иначе забирает её себе как сумму или дату, и вывод молча стоит.
+    class PayoutInputHandler(MessageHandler):
+        def check_update(self, update):
+            if not super().check_update(update):
+                return False
+            user = update.effective_user
+            return user is not None and user.id in _payout_waiting_user_ids
+
+    app.add_handler(PayoutInputHandler(filters.TEXT & ~filters.COMMAND, payout_amount_input))
     # /start и /step — пошаговый ввод (дата → тип операции → сумма → ...). Регистрируем ДО текстовой формы,
     # чтобы ввод суммы/даты/контрагента в пошаговом потоке обрабатывал ConversationHandler, а не handle_form.
     app.add_handler(conv)
