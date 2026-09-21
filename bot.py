@@ -423,7 +423,7 @@ def _parse_date_range(text: str) -> Optional[tuple[str, str]]:
 
 
 # Правила вывода дивидендов по умолчанию.
-# reserve — сколько обязательно остаётся на кошельках после вывода;
+# reserve — какой остаток рекомендуем оставлять на кошельках (только предупреждение, вывод не ограничивает);
 # round_to — до скольки округляем сумму вниз; participants — кому и в какой доле.
 DEFAULT_PAYOUT_RULES = {
     "reserve": 30000.0,
@@ -496,7 +496,7 @@ def _payout_from_reserve(liquid: float, reserve: float, rules: dict) -> float:
 def _compute_payout(balances: dict, rules: dict, payout: float) -> dict:
     """
     Делит сумму вывода между участниками по долям.
-    Возвращает словарь с liquid, reserve (неснижаемый остаток из настроек), payout, remainder, per_wallet, shares.
+    Возвращает словарь с liquid, reserve (рекомендуемый остаток из настроек), payout, remainder, per_wallet, shares.
     """
     per_wallet = _payout_wallet_balances(balances, rules)
     liquid = round(sum(per_wallet.values()), 2)
@@ -1887,20 +1887,24 @@ def _keyboard_payout_start() -> InlineKeyboardMarkup:
     ])
 
 
+def _payout_reserve_hint(reserve: float) -> str:
+    """Рекомендация по остатку на счетах — только предупреждение, вывод не ограничивает."""
+    return f"⚠️ Рекомендуется оставлять на счетах остаток (минимально {_format_rub(reserve)} ₽)"
+
+
 def _format_payout_prompt(mode: str, liquid: float, rules: dict) -> str:
     """Запрос суммы: сколько вывести (amount) или сколько оставить на кошельках (reserve)."""
     if mode == "amount":
-        return (
-            "💰 *ВЫВОД КОНКРЕТНОЙ СУММЫ*\n\n"
-            f"На кошельках: *{_format_amount(liquid)} ₽*\n\n"
-            "Сколько выводим? Введите сумму — она разделится между участниками:"
-        )
-    lines = ["🏦 *ВЫВОД С ОСТАТКОМ РЕЗЕРВА*", "", f"На кошельках: *{_format_amount(liquid)} ₽*"]
+        lines = ["💰 *ВЫВОД КОНКРЕТНОЙ СУММЫ*"]
+        ask = "Сколько выводим? Введите сумму — она разделится между участниками:"
+    else:
+        lines = ["🏦 *ВЫВОД С ОСТАТКОМ РЕЗЕРВА*"]
+        ask = "Сколько оставляем на кошельках? Введите сумму — бот посчитает, сколько вывести:"
+    lines += ["", f"На кошельках: *{_format_amount(liquid)} ₽*"]
     reserve = float(rules.get("reserve", 0) or 0)
     if reserve > 0:
-        lines.append(f"_Неснижаемый остаток по правилам — {_format_rub(reserve)} ₽_")
-    lines.append("")
-    lines.append("Сколько оставляем на кошельках? Введите сумму — бот посчитает, сколько вывести:")
+        lines.append(_payout_reserve_hint(reserve))
+    lines += ["", ask]
     return "\n".join(lines)
 
 
@@ -2090,7 +2094,7 @@ def _format_payout_confirm(calc: dict, wallet_amounts: dict) -> str:
         lines.append(f"• {_escape_md(wallet)}: {_format_amount(left)} ₽")
     notes = []
     if calc["remainder"] < calc.get("reserve", 0) - 0.004:
-        notes.append(f"⚠️ Меньше неснижаемого остатка ({_format_rub(calc['reserve'])} ₽)")
+        notes.append(_payout_reserve_hint(calc["reserve"]))
     if calc.get("rounded_to"):
         notes.append(f"_Сумма к выводу округлена вниз, кратно {_format_rub(calc['rounded_to'])} ₽_")
     if notes:
@@ -3201,7 +3205,7 @@ async def notify_settings_input(update: Update, context: ContextTypes.DEFAULT_TY
 def _format_payout_settings(rules: dict) -> str:
     """Экран настроек вывода дивидендов."""
     lines = ["⚙️ *ПРАВИЛА ВЫВОДА ДИВИДЕНДОВ*", ""]
-    lines.append(f"Неснижаемый остаток: *{_format_rub(rules.get('reserve', 0))} ₽*")
+    lines.append(f"Рекомендуемый остаток: *{_format_rub(rules.get('reserve', 0))} ₽*")
     round_to = float(rules.get("round_to", 0) or 0)
     lines.append("Округление: " + (f"*до {_format_rub(round_to)} ₽*" if round_to > 0 else "*без округления*"))
     wstep = float(rules.get("wallet_round_to", 0) or 0)
@@ -3289,7 +3293,8 @@ async def payout_settings_callback(update: Update, context: ContextTypes.DEFAULT
         if uid is not None:
             _payset_waiting_user_ids.add(uid)
         prompt = {
-            "reserve": "Сколько оставлять на кошельках после вывода? Введите сумму в рублях:",
+            "reserve": "Какой остаток рекомендуется оставлять на счетах? Если после вывода останется меньше, "
+                       "бот предупредит. Введите сумму в рублях (0 — без предупреждения):",
             "round_to": "До скольки округлять сумму вывода вниз? Введите число (0 — не округлять):",
             "wallet_round_to": "Кратно скольки списывать с каждого кошелька? Введите число (0 — как есть):",
         }[field]
