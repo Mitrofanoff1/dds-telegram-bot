@@ -2082,11 +2082,20 @@ def _format_payout_confirm(calc: dict, wallet_amounts: dict) -> str:
         if amount > 0.004:
             lines.append(f"   {_format_rub_exact(amount)} — {_escape_md(wallet)}")
     lines.append("")
-    lines.append(f"Останется на кошельках: {_format_rub_exact(calc['remainder'])} ₽")
+    lines.append(f"Останется на кошельках: {_format_amount(calc['remainder'])} ₽")
+    for wallet, balance in calc["per_wallet"].items():
+        left = round(float(balance) - float(wallet_amounts.get(wallet, 0)), 2)
+        if abs(left) < 0.005:
+            left = 0.0  # без «-0,00»
+        lines.append(f"• {_escape_md(wallet)}: {_format_amount(left)} ₽")
+    notes = []
     if calc["remainder"] < calc.get("reserve", 0) - 0.004:
-        lines.append(f"⚠️ Меньше неснижаемого остатка ({_format_rub(calc['reserve'])} ₽)")
+        notes.append(f"⚠️ Меньше неснижаемого остатка ({_format_rub(calc['reserve'])} ₽)")
     if calc.get("rounded_to"):
-        lines.append(f"_Сумма к выводу округлена вниз, кратно {_format_rub(calc['rounded_to'])} ₽_")
+        notes.append(f"_Сумма к выводу округлена вниз, кратно {_format_rub(calc['rounded_to'])} ₽_")
+    if notes:
+        lines.append("")
+        lines.extend(notes)
     return "\n".join(lines)
 
 
