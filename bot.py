@@ -2739,6 +2739,39 @@ async def _reminders_loop(application) -> None:
         await asyncio.sleep(60)
 
 
+async def _webhook_guard_loop(application) -> None:
+    """
+    Бот работает через polling. Если боту прописали webhook — значит, проснулась старая копия
+    (на Render она оживает с новым месяцем бесплатных часов) и забирает все сообщения себе,
+    считая фонды по старым правилам. Раз в минуту проверяем, снимаем webhook и пишем владельцу.
+    """
+    warned = {}
+    while True:
+        try:
+            info = await application.bot.get_webhook_info()
+            url = (info.url or "").strip()
+            if url:
+                await application.bot.delete_webhook()
+                print(f"[Бот] Снят чужой webhook: {url}", file=sys.stderr)
+                today = date.today()
+                if warned.get(url) != today:
+                    warned[url] = today
+                    text = (
+                        "⚠️ Сообщения бота перехватывала старая копия:\n"
+                        f"{url}\n\n"
+                        "Вернул их сюда. Проверьте операции за сегодня — "
+                        "та копия могла посчитать фонды по старым правилам."
+                    )
+                    for chat_id in _parse_allowed_user_ids():
+                        try:
+                            await application.bot.send_message(chat_id=chat_id, text=text)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /payments — платёжный календарь на текущий месяц."""
     try:
@@ -5099,7 +5132,36 @@ def _run_webhook_with_health(app: Application, port: int, webhook_url: str) -> N
     asyncio.run(run())
 
 
+def _serve_disabled_stub(port: int) -> None:
+    """Пустой веб-сервер вместо бота: деплой проходит, а к Telegram копия не подключается."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = "Бот ДДС работает на Amvera, эта копия отключена".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
 def main() -> None:
+    # С 21.08.2026 бот живёт на Amvera. Старый сервис на Render оживает с новым месяцем
+    # бесплатных часов и перехватывает сообщения через webhook — там бот не запускаем.
+    # Render сам выставляет RENDER=true.
+    if os.getenv("RENDER"):
+        print("[Бот] Запуск на Render отключён: бот работает на Amvera", file=sys.stderr)
+        _serve_disabled_stub(int(os.environ.get("PORT", "10000")))
+        return
+
     # На Python 3.10+ в MainThread может не быть event loop — PTB падает без этого
     try:
         asyncio.get_event_loop()
@@ -5297,6 +5359,11 @@ def main() -> None:
             print(f"[Бот] Напоминания: платежи в {REMINDER_HOUR}:00, проверка заполнения ДДС в {DAILY_FILL_HOUR}:00", file=sys.stderr)
         except Exception:
             pass
+        if not webhook_base:
+            try:
+                application.create_task(_webhook_guard_loop(application))
+            except Exception:
+                pass
 
     app.post_init = _set_commands
 
